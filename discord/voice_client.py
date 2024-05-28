@@ -482,6 +482,7 @@ class VoiceClient(VoiceProtocol):
                             "Disconnected from voice by force... potentially"
                             " reconnecting."
                         )
+                        # I removed this part because discord suggests not reconnecting on a 4014 code
                         # successful = await self.potential_reconnect()
                         # if successful:
                         #     continue
