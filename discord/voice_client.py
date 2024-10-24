@@ -68,7 +68,6 @@ if TYPE_CHECKING:
     from .types.voice import VoiceServerUpdate as VoiceServerUpdatePayload
     from .user import ClientUser
 
-
 has_nacl: bool
 
 try:
@@ -82,7 +81,6 @@ __all__ = (
     "VoiceProtocol",
     "VoiceClient",
 )
-
 
 _log = logging.getLogger(__name__)
 
@@ -627,28 +625,30 @@ class VoiceClient(VoiceProtocol):
 
     @overload
     def play(
-        self,
-        source: AudioSource,
-        *,
-        after: Callable[[Exception | None], Any] | None = None,
-        wait_finish: Literal[False] = False,
-    ) -> None: ...
+            self,
+            source: AudioSource,
+            *,
+            after: Callable[[Exception | None], Any] | None = None,
+            wait_finish: Literal[False] = False,
+    ) -> None:
+        ...
 
     @overload
     def play(
-        self,
-        source: AudioSource,
-        *,
-        after: Callable[[Exception | None], Any] | None = None,
-        wait_finish: Literal[True],
-    ) -> asyncio.Future: ...
+            self,
+            source: AudioSource,
+            *,
+            after: Callable[[Exception | None], Any] | None = None,
+            wait_finish: Literal[True],
+    ) -> asyncio.Future:
+        ...
 
     def play(
-        self,
-        source: AudioSource,
-        *,
-        after: Callable[[Exception | None], Any] | None = None,
-        wait_finish: bool = False,
+            self,
+            source: AudioSource,
+            *,
+            after: Callable[[Exception | None], Any] | None = None,
+            wait_finish: bool = False,
     ) -> None | asyncio.Future:
         """Plays an :class:`AudioSource`.
 
@@ -858,8 +858,12 @@ class VoiceClient(VoiceProtocol):
 
             try:
                 data = self.socket.recv(4096)
+                self.unpack_audio(data)
             except OSError:
                 self.stop_recording()
+                continue
+            except nacl.exceptions.CryptoError as e:
+                _log.error("An error while decrypting occurred", e)
                 continue
 
             self.unpack_audio(data)
