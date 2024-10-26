@@ -910,7 +910,7 @@ class VoiceClient(VoiceProtocol):
                 self.stop_recording()
                 continue
             except nacl.exceptions.CryptoError as e:
-                _log.error("An error while decrypting occurred", e)
+                _log.error("An error while decrypting occurred: %s", e)
                 continue
 
             self.unpack_audio(data)
