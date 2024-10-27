@@ -878,37 +878,37 @@ class VoiceClient(VoiceProtocol):
 
     def recv_decoded_audio(self, data: RawData):
         # Add silence when they were not being recorded.
-        # if data.ssrc not in self.user_timestamps:  # First packet from user
-        #     if (
-        #         not self.user_timestamps or not self.sync_start
-        #     ):  # First packet from anyone
-        #         self.first_packet_timestamp = data.receive_time
-        #         silence = 0
-        #
-        #     else:  # Previously received a packet from someone else
-        #         silence = (
-        #             (data.receive_time - self.first_packet_timestamp) * 48000
-        #         ) - 960
-        #
-        # else:  # Previously received a packet from user
-        #     dRT = (
-        #         data.receive_time - self.user_timestamps[data.ssrc][1]
-        #     ) * 48000  # delta receive time
-        #     dT = data.timestamp - self.user_timestamps[data.ssrc][0]  # delta timestamp
-        #     diff = abs(100 - dT * 100 / dRT)
-        #     if (
-        #         diff > 60 and dT != 960
-        #     ):  # If the difference in change is more than 60% threshold
-        #         silence = dRT - 960
-        #     else:
-        #         silence = dT - 960
+        if data.ssrc not in self.user_timestamps:  # First packet from user
+            if (
+                not self.user_timestamps or not self.sync_start
+            ):  # First packet from anyone
+                self.first_packet_timestamp = data.receive_time
+                silence = 0
+
+            else:  # Previously received a packet from someone else
+                silence = (
+                    (data.receive_time - self.first_packet_timestamp) * 48000
+                ) - 960
+
+        else:  # Previously received a packet from user
+            dRT = (
+                data.receive_time - self.user_timestamps[data.ssrc][1]
+            ) * 48000  # delta receive time
+            dT = data.timestamp - self.user_timestamps[data.ssrc][0]  # delta timestamp
+            diff = abs(100 - dT * 100 / dRT)
+            if (
+                diff > 60 and dT != 960
+            ):  # If the difference in change is more than 60% threshold
+                silence = dRT - 960
+            else:
+                silence = dT - 960
 
         self.user_timestamps.update({data.ssrc: (data.timestamp, data.receive_time)})
 
-        # data.decoded_data = (
-        #     struct.pack("<h", 0) * max(0, int(silence)) * opus._OpusStruct.CHANNELS
-        #     + data.decoded_data
-        # )
+        data.decoded_data = (
+            struct.pack("<h", 0) * max(0, int(silence)) * opus._OpusStruct.CHANNELS
+            + data.decoded_data
+        )
 
         while data.ssrc not in self.ws.ssrc_map:
             time.sleep(0.05)
