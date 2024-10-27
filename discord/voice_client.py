@@ -909,11 +909,9 @@ class VoiceClient(VoiceProtocol):
             except OSError:
                 self.stop_recording()
                 continue
-            except nacl.exceptions.CryptoError as e:
+            except (nacl.exceptions.CryptoError | IndexError) as e:
                 _log.error("An error while decrypting occurred: %s", e)
                 continue
-
-            self.unpack_audio(data)
 
         self.stopping_time = time.perf_counter()
         self.sink.cleanup()
@@ -924,6 +922,8 @@ class VoiceClient(VoiceProtocol):
             print(result)
 
     def recv_decoded_audio(self, data: RawData):
+        max_silence_duration = 48000 * 2  # Cap silence to 2 seconds
+
         # Add silence when they were not being recorded.
         data.user_id = self.ws.ssrc_map.get(data.ssrc, {}).get("user_id")
 
