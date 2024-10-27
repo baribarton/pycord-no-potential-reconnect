@@ -862,11 +862,9 @@ class VoiceClient(VoiceProtocol):
             except OSError:
                 self.stop_recording()
                 continue
-            except nacl.exceptions.CryptoError as e:
+            except (nacl.exceptions.CryptoError | IndexError) as e:
                 _log.error("An error while decrypting occurred: %s", e)
                 continue
-
-            self.unpack_audio(data)
 
         self.stopping_time = time.perf_counter()
         self.sink.cleanup()
@@ -877,37 +875,42 @@ class VoiceClient(VoiceProtocol):
             print(result)
 
     def recv_decoded_audio(self, data: RawData):
+        max_silence_duration = 48000 * 2  # Cap silence to 2 seconds
+
         # Add silence when they were not being recorded.
         if data.ssrc not in self.user_timestamps:  # First packet from user
             if (
-                not self.user_timestamps or not self.sync_start
+                    not self.user_timestamps or not self.sync_start
             ):  # First packet from anyone
                 self.first_packet_timestamp = data.receive_time
                 silence = 0
 
             else:  # Previously received a packet from someone else
                 silence = (
-                    (data.receive_time - self.first_packet_timestamp) * 48000
-                ) - 960
+                                  (data.receive_time - self.first_packet_timestamp) * 48000
+                          ) - 960
 
         else:  # Previously received a packet from user
             dRT = (
-                data.receive_time - self.user_timestamps[data.ssrc][1]
-            ) * 48000  # delta receive time
+                          data.receive_time - self.user_timestamps[data.ssrc][1]
+                  ) * 48000  # delta receive time
             dT = data.timestamp - self.user_timestamps[data.ssrc][0]  # delta timestamp
             diff = abs(100 - dT * 100 / dRT)
             if (
-                diff > 60 and dT != 960
+                    diff > 60 and dT != 960
             ):  # If the difference in change is more than 60% threshold
                 silence = dRT - 960
             else:
                 silence = dT - 960
 
+        # Min silence is 0, max is max_silence_duration
+        silence = max(0, min(silence, max_silence_duration))
+
         self.user_timestamps.update({data.ssrc: (data.timestamp, data.receive_time)})
 
         data.decoded_data = (
-            struct.pack("<h", 0) * max(0, int(silence)) * opus._OpusStruct.CHANNELS
-            + data.decoded_data
+                struct.pack("<h", 0) * int(silence) * opus._OpusStruct.CHANNELS
+                + data.decoded_data
         )
 
         while data.ssrc not in self.ws.ssrc_map:
