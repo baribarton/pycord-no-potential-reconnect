@@ -896,7 +896,18 @@ class DiscordVoiceWebSocket:
         struct.pack_into(">H", packet, 2, 70)  # 70 = Length
         struct.pack_into(">I", packet, 4, state.ssrc)
         state.socket.sendto(packet, (state.endpoint_ip, state.voice_port))
-        recv = await self.loop.sock_recv(state.socket, 74)
+
+        try:
+            recv = await asyncio.wait_for(self.loop.sock_recv(state.socket, 74), timeout=2.0)
+        except asyncio.TimeoutError as e:
+            _log.error(f"Websocket Receive operation timed out. This can happen due to malformed data. {e}")
+            _log.debug(f"Problematic packet: {packet}")
+            raise e
+        except OSError as e:
+            _log.error(f"Websocket Receive operation encountered an OSError: {e}")
+            _log.debug(f"Problematic packet: {packet}")
+            raise e
+
         _log.debug("received packet in initial_connection: %s", recv)
 
         # the ip is ascii starting at the 8th byte and ending at the first null
