@@ -984,9 +984,14 @@ class VoiceClient(VoiceProtocol):
             {data.user_id: (data.ssrc, data.timestamp, data.receive_time)}
         )
 
+        max_silence_duration = 48000 * 2  # Cap silence to 2 seconds
+
+        # Min silence is 0, max is max_silence_duration
+        silence = max(0, min(int(silence), max_silence_duration))
+
         data.decoded_data = (
-            struct.pack("<h", 0) * max(0, int(silence)) * opus._OpusStruct.CHANNELS
-            + data.decoded_data
+                struct.pack("<h", 0) * silence * opus._OpusStruct.CHANNELS
+                + data.decoded_data
         )
 
         while data.ssrc not in self.ws.ssrc_map:
