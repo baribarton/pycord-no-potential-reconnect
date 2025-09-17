@@ -51,6 +51,7 @@ from ..commands import (
     Converter,
     Group,
     GuildChannelConverter,
+    MemberConverter,
     RoleConverter,
     UserConverter,
 )
@@ -184,8 +185,10 @@ class BridgeCommand:
     @property
     def name_localizations(self) -> dict[str, str] | None:
         """Returns name_localizations from :attr:`slash_variant`
-        You can edit/set name_localizations directly with
+           You can edit/set name_localizations directly with
+
         .. code-block:: python3
+
             bridge_command.name_localizations["en-UK"] = ...  # or any other locale
             # or
             bridge_command.name_localizations = {"en-UK": ..., "fr-FR": ...}
@@ -199,8 +202,10 @@ class BridgeCommand:
     @property
     def description_localizations(self) -> dict[str, str] | None:
         """Returns description_localizations from :attr:`slash_variant`
-        You can edit/set description_localizations directly with
+           You can edit/set description_localizations directly with
+
         .. code-block:: python3
+
             bridge_command.description_localizations["en-UK"] = ...  # or any other locale
             # or
             bridge_command.description_localizations = {"en-UK": ..., "fr-FR": ...}
@@ -566,13 +571,21 @@ def has_permissions(**perms: bool):
 
 
 class MentionableConverter(Converter):
-    """A converter that can convert a mention to a user or a role."""
+    """A converter that can convert a mention to a member, a user or a role."""
 
     async def convert(self, ctx, argument):
         try:
             return await RoleConverter().convert(ctx, argument)
         except BadArgument:
-            return await UserConverter().convert(ctx, argument)
+            pass
+
+        if ctx.guild:
+            try:
+                return await MemberConverter().convert(ctx, argument)
+            except BadArgument:
+                pass
+
+        return await UserConverter().convert(ctx, argument)
 
 
 class AttachmentConverter(Converter):
@@ -600,6 +613,7 @@ BRIDGE_CONVERTER_MAPPING = {
     SlashCommandOptionType.mentionable: MentionableConverter,
     SlashCommandOptionType.number: float,
     SlashCommandOptionType.attachment: AttachmentConverter,
+    discord.Member: MemberConverter,
 }
 
 
@@ -608,16 +622,24 @@ class BridgeOption(Option, Converter):
     command option and a prefixed command argument for bridge commands.
     """
 
+    def __init__(self, input_type, *args, **kwargs):
+        self.converter = kwargs.pop("converter", None)
+        super().__init__(input_type, *args, **kwargs)
+
+        self.converter = self.converter or BRIDGE_CONVERTER_MAPPING.get(input_type)
+
     async def convert(self, ctx, argument: str) -> Any:
         try:
             if self.converter is not None:
-                converted = await self.converter.convert(ctx, argument)
+                converted = await self.converter().convert(ctx, argument)
             else:
-                converter = BRIDGE_CONVERTER_MAPPING[self.input_type]
-                if issubclass(converter, Converter):
+                converter = BRIDGE_CONVERTER_MAPPING.get(self.input_type)
+                if isinstance(converter, type) and issubclass(converter, Converter):
                     converted = await converter().convert(ctx, argument)  # type: ignore # protocol class
-                else:
+                elif callable(converter):
                     converted = converter(argument)
+                else:
+                    raise TypeError(f"Invalid converter: {converter}")
 
             if self.choices:
                 choices_names: list[str | int | float] = [

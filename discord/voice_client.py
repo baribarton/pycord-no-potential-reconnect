@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from .types.voice import VoiceServerUpdate as VoiceServerUpdatePayload
     from .user import ClientUser
 
+
 has_nacl: bool
 
 try:
@@ -81,6 +82,7 @@ __all__ = (
     "VoiceProtocol",
     "VoiceClient",
 )
+
 
 _log = logging.getLogger(__name__)
 
@@ -263,12 +265,14 @@ class VoiceClient(VoiceProtocol):
         self.sink = None
         self.starting_time = None
         self.stopping_time = None
+        self.temp_queued_data: dict[int, list] = {}
 
     warn_nacl = not has_nacl
     supported_modes: tuple[SupportedModes, ...] = (
         "xsalsa20_poly1305_lite",
         "xsalsa20_poly1305_suffix",
         "xsalsa20_poly1305",
+        "aead_xchacha20_poly1305_rtpsize",
     )
 
     @property
@@ -323,11 +327,7 @@ class VoiceClient(VoiceProtocol):
             )
             return
 
-        self.endpoint = endpoint
-        if self.endpoint.startswith("wss://"):
-            # Just in case, strip it off since we're going to add it later
-            self.endpoint = self.endpoint[6:]
-
+        self.endpoint = endpoint.removeprefix("wss://")
         # This gets set later
         self.endpoint_ip = MISSING
 
@@ -469,8 +469,8 @@ class VoiceClient(VoiceProtocol):
                     # The following close codes are undocumented, so I will document them here.
                     # 1000 - normal closure (obviously)
                     # 4014 - voice channel has been deleted.
-                    # 4015 - voice server has crashed
-                    if exc.code in (1000, 4015):
+                    # 4015 - voice server has crashed, we should resume
+                    if exc.code == 1000:
                         _log.info(
                             "Disconnecting from voice normally, close code %d.",
                             exc.code,
@@ -482,17 +482,31 @@ class VoiceClient(VoiceProtocol):
                             "Disconnected from voice by force... potentially"
                             " reconnecting."
                         )
-                        # I removed this part because discord suggests not reconnecting on a 4014 code
-                        # successful = await self.potential_reconnect()
-                        # if successful:
-                        #     continue
+                        successful = await self.potential_reconnect()
+                        if successful:
+                            continue
 
-                        # _log.info(
-                        #     "Reconnect was unsuccessful, disconnecting from voice"
-                        #     " normally..."
-                        # )
+                        _log.info(
+                            "Reconnect was unsuccessful, disconnecting from voice"
+                            " normally..."
+                        )
                         await self.disconnect()
                         break
+                    if exc.code == 4015:
+                        _log.info("Disconnected from voice, trying to resume...")
+
+                        try:
+                            await self.ws.resume()
+                        except asyncio.TimeoutError:
+                            _log.info(
+                                "Could not resume the voice connection... Disconnection..."
+                            )
+                            if self._connected.is_set():
+                                await self.disconnect(force=True)
+                        else:
+                            _log.info("Successfully resumed voice connection")
+                            continue
+
                 if not reconnect:
                     await self.disconnect()
                     raise
@@ -564,6 +578,7 @@ class VoiceClient(VoiceProtocol):
         return encrypt_packet(header, data)
 
     def _encrypt_xsalsa20_poly1305(self, header: bytes, data) -> bytes:
+        # Deprecated, remove in 2.7
         box = nacl.secret.SecretBox(bytes(self.secret_key))
         nonce = bytearray(24)
         nonce[:12] = header
@@ -571,12 +586,14 @@ class VoiceClient(VoiceProtocol):
         return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext
 
     def _encrypt_xsalsa20_poly1305_suffix(self, header: bytes, data) -> bytes:
+        # Deprecated, remove in 2.7
         box = nacl.secret.SecretBox(bytes(self.secret_key))
         nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
 
         return header + box.encrypt(bytes(data), nonce).ciphertext + nonce
 
     def _encrypt_xsalsa20_poly1305_lite(self, header: bytes, data) -> bytes:
+        # Deprecated, remove in 2.7
         box = nacl.secret.SecretBox(bytes(self.secret_key))
         nonce = bytearray(24)
 
@@ -585,7 +602,22 @@ class VoiceClient(VoiceProtocol):
 
         return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext + nonce[:4]
 
+    def _encrypt_aead_xchacha20_poly1305_rtpsize(self, header: bytes, data) -> bytes:
+        # Required as of Nov 18 2024
+        box = nacl.secret.Aead(bytes(self.secret_key))
+        nonce = bytearray(24)
+
+        nonce[:4] = struct.pack(">I", self._lite_nonce)
+        self.checked_add("_lite_nonce", 1, 4294967295)
+
+        return (
+            header
+            + box.encrypt(bytes(data), bytes(header), bytes(nonce)).ciphertext
+            + nonce[:4]
+        )
+
     def _decrypt_xsalsa20_poly1305(self, header, data):
+        # Deprecated, remove in 2.7
         box = nacl.secret.SecretBox(bytes(self.secret_key))
 
         nonce = bytearray(24)
@@ -594,6 +626,7 @@ class VoiceClient(VoiceProtocol):
         return self.strip_header_ext(box.decrypt(bytes(data), bytes(nonce)))
 
     def _decrypt_xsalsa20_poly1305_suffix(self, header, data):
+        # Deprecated, remove in 2.7
         box = nacl.secret.SecretBox(bytes(self.secret_key))
 
         nonce_size = nacl.secret.SecretBox.NONCE_SIZE
@@ -602,6 +635,7 @@ class VoiceClient(VoiceProtocol):
         return self.strip_header_ext(box.decrypt(bytes(data[:-nonce_size]), nonce))
 
     def _decrypt_xsalsa20_poly1305_lite(self, header, data):
+        # Deprecated, remove in 2.7
         box = nacl.secret.SecretBox(bytes(self.secret_key))
 
         nonce = bytearray(24)
@@ -609,6 +643,19 @@ class VoiceClient(VoiceProtocol):
         data = data[:-4]
 
         return self.strip_header_ext(box.decrypt(bytes(data), bytes(nonce)))
+
+    def _decrypt_aead_xchacha20_poly1305_rtpsize(self, header, data):
+        # Required as of Nov 18 2024
+        box = nacl.secret.Aead(bytes(self.secret_key))
+
+        nonce = bytearray(24)
+        nonce[:4] = data[-4:]
+        data = data[:-4]
+
+        r = box.decrypt(bytes(data), bytes(header), bytes(nonce))
+        # Discord adds 8 bytes of data before the opus data.
+        # This can be removed, and at this time, discarded as it is unclear what they are for.
+        return r[8:]
 
     @staticmethod
     def strip_header_ext(data):
@@ -625,30 +672,28 @@ class VoiceClient(VoiceProtocol):
 
     @overload
     def play(
-            self,
-            source: AudioSource,
-            *,
-            after: Callable[[Exception | None], Any] | None = None,
-            wait_finish: Literal[False] = False,
-    ) -> None:
-        ...
+        self,
+        source: AudioSource,
+        *,
+        after: Callable[[Exception | None], Any] | None = None,
+        wait_finish: Literal[False] = False,
+    ) -> None: ...
 
     @overload
     def play(
-            self,
-            source: AudioSource,
-            *,
-            after: Callable[[Exception | None], Any] | None = None,
-            wait_finish: Literal[True],
-    ) -> asyncio.Future:
-        ...
+        self,
+        source: AudioSource,
+        *,
+        after: Callable[[Exception | None], Any] | None = None,
+        wait_finish: Literal[True],
+    ) -> asyncio.Future: ...
 
     def play(
-            self,
-            source: AudioSource,
-            *,
-            after: Callable[[Exception | None], Any] | None = None,
-            wait_finish: bool = False,
+        self,
+        source: AudioSource,
+        *,
+        after: Callable[[Exception | None], Any] | None = None,
+        wait_finish: bool = False,
     ) -> None | asyncio.Future:
         """Plays an :class:`AudioSource`.
 
@@ -730,11 +775,12 @@ class VoiceClient(VoiceProtocol):
         data: :class:`bytes`
             Bytes received by Discord via the UDP connection used for sending and receiving voice data.
         """
-        if 200 <= data[1] <= 204:
-            # RTCP received.
-            # RTCP provides information about the connection
-            # as opposed to actual audio data, so it's not
-            # important at the moment.
+        if data[1] & 0x78 != 0x78:
+            # We Should Ignore Any Payload Types We Do Not Understand
+            # Ref RFC 3550 5.1 payload type
+            # At Some Point We Noted That We Should Ignore Only Types 200 - 204 inclusive.
+            # They Were Marked As RTCP: Provides Information About The Connection
+            # This Was Too Broad Of A Whitelist, It Is Unclear If This Is Too Narrow Of A Whitelist
             return
         if self.paused:
             return
@@ -814,9 +860,9 @@ class VoiceClient(VoiceProtocol):
         """
         if not self.recording:
             raise RecordingException("Not currently recording audio.")
+        self.decoder.stop()
         self.recording = False
         self.paused = False
-        self.decoder.stop()
 
     def toggle_pause(self):
         """Pauses or unpauses the recording.
@@ -846,7 +892,7 @@ class VoiceClient(VoiceProtocol):
         # it by user, handles pcm files and
         # silence that should be added.
 
-        self.user_timestamps: dict[int, tuple[int, float]] = {}
+        self.user_timestamps: dict[int, tuple[int, int, float]] = {}
         self.starting_time = time.perf_counter()
         self.first_packet_timestamp: float
         while self.recording:
@@ -858,13 +904,11 @@ class VoiceClient(VoiceProtocol):
 
             try:
                 data = self.socket.recv(4096)
-                self.unpack_audio(data)
             except OSError:
                 self.stop_recording()
                 continue
-            except (nacl.exceptions.CryptoError, IndexError) as e:
-                _log.error("An error occurred while decrypting: %s - %s", type(e).__name__, e)
-                continue
+
+            self.unpack_audio(data)
 
         self.stopping_time = time.perf_counter()
         self.sink.cleanup()
@@ -875,42 +919,74 @@ class VoiceClient(VoiceProtocol):
             print(result)
 
     def recv_decoded_audio(self, data: RawData):
-        max_silence_duration = 48000 * 2  # Cap silence to 2 seconds
-
         # Add silence when they were not being recorded.
-        if data.ssrc not in self.user_timestamps:  # First packet from user
+        data.user_id = self.ws.ssrc_map.get(data.ssrc, {}).get("user_id")
+
+        if data.user_id is None:
+            _log.debug(
+                f"DEBUG: received packet with SSRC {data.ssrc} not linked to a user_id."
+                f"Queueing for later processing."
+            )
+            self.temp_queued_data.setdefault(data.ssrc, []).append(data)
+            return
+        elif data.ssrc in self.temp_queued_data:
+            _log.debug(
+                "DEBUG: We got %d packet(s) in queue for SSRC %d",
+                len(self.temp_queued_data[data.ssrc]),
+                data.ssrc,
+            )
+            queued_packets = self.temp_queued_data.pop(data.ssrc)
+            for q_packet in queued_packets:
+                q_packet.user_id = data.user_id
+                self._process_audio_packet(q_packet)
+
+        self._process_audio_packet(data)
+
+    def _process_audio_packet(self, data: RawData):
+        if data.user_id not in self.user_timestamps:  # First packet from user
             if (
-                    not self.user_timestamps or not self.sync_start
+                not self.user_timestamps or not self.sync_start
             ):  # First packet from anyone
                 self.first_packet_timestamp = data.receive_time
                 silence = 0
 
             else:  # Previously received a packet from someone else
                 silence = (
-                                  (data.receive_time - self.first_packet_timestamp) * 48000
-                          ) - 960
+                    (data.receive_time - self.first_packet_timestamp) * 48000
+                ) - 960
 
         else:  # Previously received a packet from user
-            dRT = (
-                          data.receive_time - self.user_timestamps[data.ssrc][1]
-                  ) * 48000  # delta receive time
-            dT = data.timestamp - self.user_timestamps[data.ssrc][0]  # delta timestamp
-            diff = abs(100 - dT * 100 / dRT)
-            if (
-                    diff > 60 and dT != 960
-            ):  # If the difference in change is more than 60% threshold
-                silence = dRT - 960
+            prev_ssrc = self.user_timestamps[data.user_id][0]
+            prev_timestamp = self.user_timestamps[data.user_id][1]
+            prev_receive_time = self.user_timestamps[data.user_id][2]
+
+            if data.ssrc != prev_ssrc:
+                _log.info(
+                    f"Received audio data from USER_ID {data.user_id} with a previous SSRC {prev_ssrc} and new "
+                    f"SSRC {data.ssrc}."
+                )
+                dRT = (data.receive_time - prev_receive_time) * 1000
+                silence = max(0, int(dRT / (1000 / 48000))) - 960
             else:
-                silence = dT - 960
+                dRT = (
+                    data.receive_time - prev_receive_time
+                ) * 48000  # delta receive time
+                dT = data.timestamp - prev_timestamp  # delta timestamp
+                diff = abs(100 - dT * 100 / dRT)
+                if (
+                    diff > 60 and dT != 960
+                ):  # If the difference in change is more than 60% threshold
+                    silence = dRT - 960
+                else:
+                    silence = dT - 960
 
-        # Min silence is 0, max is max_silence_duration
-        silence = max(0, min(silence, max_silence_duration))
-
-        self.user_timestamps.update({data.ssrc: (data.timestamp, data.receive_time)})
+        self.user_timestamps.update(
+            {data.user_id: (data.ssrc, data.timestamp, data.receive_time)}
+        )
 
         data.decoded_data = (
-                struct.pack("<h", 0) * int(silence) * opus._OpusStruct.CHANNELS
-                + data.decoded_data
+            struct.pack("<h", 0) * max(0, int(silence)) * opus._OpusStruct.CHANNELS
+            + data.decoded_data
         )
 
         while data.ssrc not in self.ws.ssrc_map:

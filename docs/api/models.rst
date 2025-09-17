@@ -221,6 +221,11 @@ Role
 .. autoclass:: RoleTags()
     :members:
 
+.. attributetable:: RoleColours
+
+.. autoclass:: RoleColours
+    :members:
+
 Scheduled Event
 ~~~~~~~~~~~~~~~
 
@@ -368,6 +373,14 @@ Interactions
 .. autoclass:: AuthorizingIntegrationOwners()
     :members:
 
+.. attributetable:: InteractionCallback
+
+.. autoclass:: InteractionCallback()
+    :members:
+
+Message Components
+------------------
+
 .. attributetable:: Component
 
 .. autoclass:: Component()
@@ -387,6 +400,48 @@ Interactions
 .. attributetable:: SelectMenu
 
 .. autoclass:: SelectMenu()
+    :members:
+    :inherited-members:
+
+.. attributetable:: Section
+
+.. autoclass:: Section()
+    :members:
+    :inherited-members:
+
+.. attributetable:: TextDisplay
+
+.. autoclass:: TextDisplay()
+    :members:
+    :inherited-members:
+
+.. attributetable:: Thumbnail
+
+.. autoclass:: Thumbnail()
+    :members:
+    :inherited-members:
+
+.. attributetable:: MediaGallery
+
+.. autoclass:: MediaGallery()
+    :members:
+    :inherited-members:
+
+.. attributetable:: FileComponent
+
+.. autoclass:: FileComponent()
+    :members:
+    :inherited-members:
+
+.. attributetable:: Separator
+
+.. autoclass:: Separator()
+    :members:
+    :inherited-members:
+
+.. attributetable:: Container
+
+.. autoclass:: Container()
     :members:
     :inherited-members:
 
@@ -505,6 +560,20 @@ Stickers
 .. autoclass:: GuildSticker()
     :members:
 
+Soundboard
+----------
+
+.. attributetable:: PartialSoundboardSound
+
+.. autoclass:: PartialSoundboardSound()
+    :members:
+
+.. attributetable:: SoundboardSound
+
+.. autoclass:: SoundboardSound()
+    :members:
+    :inherited-members:
+
 Events
 ------
 
@@ -588,6 +657,11 @@ Events
 .. autoclass:: RawVoiceChannelStatusUpdateEvent()
     :members:
 
+.. attributetable:: VoiceChannelEffectSendEvent
+
+.. autoclass:: VoiceChannelEffectSendEvent()
+    :members:
+
 
 
 Webhooks
@@ -602,3 +676,13 @@ Webhooks
 
 .. autoclass:: PartialWebhookChannel()
     :members:
+
+
+
+Collectibles
+------------
+
+.. attributetable:: Nameplate
+
+.. autoclass:: Nameplate()
+    :undoc-members:
