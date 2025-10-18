@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from .types.voice import VoiceServerUpdate as VoiceServerUpdatePayload
     from .user import ClientUser
 
+
 has_nacl: bool
 
 try:
@@ -81,6 +82,7 @@ __all__ = (
     "VoiceProtocol",
     "VoiceClient",
 )
+
 
 _log = logging.getLogger(__name__)
 
@@ -671,30 +673,28 @@ class VoiceClient(VoiceProtocol):
 
     @overload
     def play(
-            self,
-            source: AudioSource,
-            *,
-            after: Callable[[Exception | None], Any] | None = None,
-            wait_finish: Literal[False] = False,
-    ) -> None:
-        ...
+        self,
+        source: AudioSource,
+        *,
+        after: Callable[[Exception | None], Any] | None = None,
+        wait_finish: Literal[False] = False,
+    ) -> None: ...
 
     @overload
     def play(
-            self,
-            source: AudioSource,
-            *,
-            after: Callable[[Exception | None], Any] | None = None,
-            wait_finish: Literal[True],
-    ) -> asyncio.Future:
-        ...
+        self,
+        source: AudioSource,
+        *,
+        after: Callable[[Exception | None], Any] | None = None,
+        wait_finish: Literal[True],
+    ) -> asyncio.Future: ...
 
     def play(
-            self,
-            source: AudioSource,
-            *,
-            after: Callable[[Exception | None], Any] | None = None,
-            wait_finish: bool = False,
+        self,
+        source: AudioSource,
+        *,
+        after: Callable[[Exception | None], Any] | None = None,
+        wait_finish: bool = False,
     ) -> None | asyncio.Future:
         """Plays an :class:`AudioSource`.
 
@@ -861,9 +861,9 @@ class VoiceClient(VoiceProtocol):
         """
         if not self.recording:
             raise RecordingException("Not currently recording audio.")
+        self.decoder.stop()
         self.recording = False
         self.paused = False
-        self.decoder.stop()
 
     def toggle_pause(self):
         """Pauses or unpauses the recording.
@@ -905,13 +905,14 @@ class VoiceClient(VoiceProtocol):
 
             try:
                 data = self.socket.recv(4096)
-                self.unpack_audio(data)
             except OSError:
                 self.stop_recording()
                 continue
             except (nacl.exceptions.CryptoError, IndexError) as e:
                 _log.error("An error occurred while decrypting: %s - %s", type(e).__name__, e)
                 continue
+
+            self.unpack_audio(data)
 
         self.stopping_time = time.perf_counter()
         self.sink.cleanup()
@@ -922,8 +923,6 @@ class VoiceClient(VoiceProtocol):
             print(result)
 
     def recv_decoded_audio(self, data: RawData):
-        max_silence_duration = 48000 * 2  # Cap silence to 2 seconds
-
         # Add silence when they were not being recorded.
         data.user_id = self.ws.ssrc_map.get(data.ssrc, {}).get("user_id")
 
@@ -989,9 +988,14 @@ class VoiceClient(VoiceProtocol):
             {data.user_id: (data.ssrc, data.timestamp, data.receive_time)}
         )
 
+        max_silence_duration = 48000 * 2  # Cap silence to 2 seconds
+
+        # Min silence is 0, max is max_silence_duration
+        silence = max(0, min(int(silence), max_silence_duration))
+
         data.decoded_data = (
-            struct.pack("<h", 0) * max(0, int(silence)) * opus._OpusStruct.CHANNELS
-            + data.decoded_data
+                struct.pack("<h", 0) * silence * opus._OpusStruct.CHANNELS
+                + data.decoded_data
         )
 
         while data.ssrc not in self.ws.ssrc_map:
