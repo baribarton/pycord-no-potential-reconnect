@@ -908,11 +908,12 @@ class VoiceClient(VoiceProtocol):
             except OSError:
                 self.stop_recording()
                 continue
+
+            try:
+                self.unpack_audio(data)
             except (nacl.exceptions.CryptoError, IndexError) as e:
                 _log.error("An error occurred while decrypting: %s - %s", type(e).__name__, e)
                 continue
-
-            self.unpack_audio(data)
 
         self.stopping_time = time.perf_counter()
         self.sink.cleanup()
