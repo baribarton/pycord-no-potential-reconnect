@@ -35,7 +35,7 @@ import time
 import traceback
 import zlib
 from collections import deque, namedtuple
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Any
 
 import aiohttp
 
@@ -924,7 +924,7 @@ class DiscordVoiceWebSocket:
 
         await self._hook(self, msg)
 
-    async def initial_connection(self, data):
+    async def initial_connection_v1(self, data):
         state = self._connection
         state.ssrc = data["ssrc"]
         state.voice_port = data["port"]
@@ -966,6 +966,63 @@ class DiscordVoiceWebSocket:
         mode = modes[0]
         await self.select_protocol(state.ip, state.port, mode)
         _log.info("selected the voice protocol for use (%s)", mode)
+
+    async def initial_connection(self, data: Dict[str, Any]) -> None:
+        state = self._connection
+        state.ssrc = data['ssrc']
+        state.voice_port = data['port']
+        state.endpoint_ip = data['ip']
+
+        _log.debug('Connecting to voice socket')
+        await self.loop.sock_connect(state.socket, (state.endpoint_ip, state.voice_port))
+
+        state.ip, state.port = await self.discover_ip(state)
+        # there *should* always be at least one supported mode (xsalsa20_poly1305)
+        modes = [mode for mode in data['modes'] if mode in self._connection.supported_modes]
+        _log.debug('received supported encryption modes: %s', ', '.join(modes))
+
+        mode = modes[0]
+        await self.select_protocol(state.ip, state.port, mode)
+        _log.debug('selected the voice protocol for use (%s)', mode)
+
+    async def discover_ip(self, state, max_retries: int = 2, base_timeout: float = 3.0):
+        """Send a UDP discovery packet and wait for the correct 74-byte response."""
+        packet = bytearray(74)
+        struct.pack_into(">H", packet, 0, 1)
+        struct.pack_into(">H", packet, 2, 70)
+        struct.pack_into(">I", packet, 4, state.ssrc)
+
+        for attempt in range(max_retries):
+            increment = 2.0
+            attempt_timeout = base_timeout + (attempt * increment)
+
+            await self.loop.sock_sendall(state.socket, packet)
+
+            try:
+                # wait for discovery reply with timeout
+                data = await asyncio.wait_for(self.loop.sock_recv(state.socket, 74), timeout=attempt_timeout)
+
+                # validate packet
+                if len(data) == 74 and data[1] == 0x02:
+                    ip_start = 8
+                    ip_end = data.index(0, ip_start)
+                    ip = data[ip_start:ip_end].decode("ascii")
+                    port = struct.unpack_from(">H", data, len(data) - 2)[0]
+                    _log.debug("detected ip: %s port: %s", ip, port)
+                    return ip, port
+
+                # wrong packet type → keep waiting
+                _log.debug("Ignored non-discovery packet during handshake.")
+                continue
+
+            except asyncio.TimeoutError:
+                if attempt + 1 < max_retries:
+                    _log.warning("No discovery reply, retrying (%d/%d)...", attempt + 1, max_retries)
+                    await asyncio.sleep(0.5)
+                    continue
+                else:
+                    _log.error("UDP discovery timed out after %d attempts.", max_retries)
+                    raise
 
     @property
     def latency(self) -> float:
