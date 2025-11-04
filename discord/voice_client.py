@@ -375,11 +375,13 @@ class VoiceClient(VoiceProtocol):
         self._connected.set()
         return ws
 
-    async def connect(self, *, reconnect: bool, timeout: float) -> None:
+    async def connect(self, *, reconnect: bool, attempting_reconnect=False, timeout: float) -> None:
         _log.info("Connecting to voice...")
         self.timeout = timeout
 
-        for i in range(5):
+        max_attempts = 2 if not attempting_reconnect else 5
+
+        for i in range(max_attempts):
             self.prepare_handshake()
 
             # This has to be created before we start the flow.
@@ -520,7 +522,7 @@ class VoiceClient(VoiceProtocol):
                 await asyncio.sleep(retry)
                 await self.voice_disconnect()
                 try:
-                    await self.connect(reconnect=True, timeout=self.timeout)
+                    await self.connect(reconnect=True, attempting_reconnect=True, timeout=self.timeout)
                 except asyncio.TimeoutError:
                     # at this point we've retried 5 times... let's continue the loop.
                     _log.warning("Could not connect to voice... Retrying...")
