@@ -379,7 +379,7 @@ class VoiceClient(VoiceProtocol):
         _log.info("Connecting to voice...")
         self.timeout = timeout
 
-        max_attempts = 2 if not attempting_reconnect else 5
+        max_attempts = 5 if attempting_reconnect else 2
 
         for i in range(max_attempts):
             self.prepare_handshake()
