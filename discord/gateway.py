@@ -984,14 +984,14 @@ class DiscordVoiceWebSocket:
         await self.select_protocol(state.ip, state.port, mode)
         _log.debug('selected the voice protocol for use (%s)', mode)
 
-    async def discover_ip(self, state, max_retries: int = 2, base_timeout: float = 3.0):
+    async def discover_ip(self, state, max_attempts: int = 2, base_timeout: float = 3.0):
         """Send a UDP discovery packet and wait for the correct 74-byte response."""
         packet = bytearray(74)
         struct.pack_into(">H", packet, 0, 1)
         struct.pack_into(">H", packet, 2, 70)
         struct.pack_into(">I", packet, 4, state.ssrc)
 
-        for attempt in range(max_retries):
+        for attempt in range(max_attempts):
             increment = 2.0
             attempt_timeout = base_timeout + (attempt * increment)
 
@@ -1015,12 +1015,12 @@ class DiscordVoiceWebSocket:
                 continue
 
             except asyncio.TimeoutError:
-                if attempt + 1 < max_retries:
-                    _log.warning("No discovery reply, retrying (%d/%d)...", attempt + 1, max_retries)
+                if attempt + 1 < max_attempts:
+                    _log.warning("No discovery reply, retrying (%d/%d)...", attempt + 1, max_attempts)
                     await asyncio.sleep(0.5)
                     continue
                 else:
-                    _log.error("UDP discovery timed out after %d attempts.", max_retries)
+                    _log.error("UDP discovery timed out after %d attempts.", max_attempts)
                     raise
 
     @property
