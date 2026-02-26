@@ -5,7 +5,7 @@ Wraps the ``davey`` library behind a stable interface so no other module ever
 imports ``davey`` directly.  Swapping the backend later means changing only
 this file.
 
-Protocol reference: critscribbler/protocol.md
+Protocol reference: Discord DAVE protocol specification
 Library docs: davey 0.1.3 type stubs (davey/__init__.pyi)
 """
 
@@ -67,7 +67,7 @@ class DaveSession:
                 "E2EE voice requires the 'davey' library. "
                 "Install it with: pip install davey"
             )
-        self._s: _davey.DaveSession = _davey.DaveSession(
+        self._davey_session: _davey.DaveSession = _davey.DaveSession(
             protocol_version, user_id, channel_id
         )
         # Protects decrypt_opus from concurrent calls: recv_audio thread and
@@ -89,17 +89,17 @@ class DaveSession:
     @property
     def ready(self) -> bool:
         """``True`` after MLS welcome or own commit is processed (session active)."""
-        return self._s.ready
+        return self._davey_session.ready
 
     @property
     def epoch(self) -> Optional[int]:
         """Current MLS epoch, or ``None`` before the first group is established."""
-        return self._s.epoch
+        return self._davey_session.epoch
 
     @property
     def status_name(self) -> str:
         """Human-readable status string, e.g. ``'SessionStatus.active'``."""
-        return str(self._s.status)
+        return str(self._davey_session.status)
 
     # ── MLS handshake ────────────────────────────────────────────────────────
 
@@ -113,7 +113,7 @@ class DaveSession:
         ValueError
             If the external sender data is malformed.
         """
-        self._s.set_external_sender(data)
+        self._davey_session.set_external_sender(data)
         _log.debug("DAVE: external sender set (%d bytes)", len(data))
 
     def get_key_package(self) -> bytes:
@@ -122,9 +122,9 @@ class DaveSession:
         Each call produces a new key package (unique nonce per MLS spec).
         Do not call more than once per handshake phase.
         """
-        kp = self._s.get_serialized_key_package()
-        _log.debug("DAVE: key package generated (%d bytes)", len(kp))
-        return kp
+        key_package = self._davey_session.get_serialized_key_package()
+        _log.debug("DAVE: key package generated (%d bytes)", len(key_package))
+        return key_package
 
     def process_proposals(
         self,
@@ -150,12 +150,12 @@ class DaveSession:
         ValueError
             If proposals cannot be processed (e.g. no group yet).
         """
-        op = (
+        proposals_operation = (
             _davey.ProposalsOperationType.append
             if operation_type == 0
             else _davey.ProposalsOperationType.revoke
         )
-        result = self._s.process_proposals(op, data)
+        result = self._davey_session.process_proposals(proposals_operation, data)
         if isinstance(result, _davey.CommitWelcome):
             _log.debug(
                 "DAVE: proposals processed → commit produced (welcome=%s)",
@@ -173,7 +173,7 @@ class DaveSession:
         ValueError
             If the commit is invalid or cannot be applied.
         """
-        self._s.process_commit(commit)
+        self._davey_session.process_commit(commit)
         _log.debug(
             "DAVE: commit processed, epoch=%s ready=%s", self.epoch, self.ready
         )
@@ -186,7 +186,7 @@ class DaveSession:
         ValueError
             If the welcome is invalid or cannot be applied.
         """
-        self._s.process_welcome(welcome)
+        self._davey_session.process_welcome(welcome)
         _log.debug(
             "DAVE: welcome processed, epoch=%s ready=%s", self.epoch, self.ready
         )
@@ -219,18 +219,18 @@ class DaveSession:
         """
         with self._lock:
             try:
-                result = self._s.decrypt(user_id, _davey.MediaType.audio, data)
+                result = self._davey_session.decrypt(user_id, _davey.MediaType.audio, data)
                 self._decrypt_ok[user_id] = self._decrypt_ok.get(user_id, 0) + 1
                 return result
             except ValueError as exc:
                 self._decrypt_fail[user_id] = self._decrypt_fail.get(user_id, 0) + 1
-                msg = str(exc)
-                if "NoDecryptorForUser" in msg:
+                error_message = str(exc)
+                if "NoDecryptorForUser" in error_message:
                     # Normal during MLS handshake — new member not yet welcomed.
-                    _log.info("DAVE decrypt: no decryptor yet uid=%d (handshake pending)", user_id)
-                elif "DuplicateNonce" in msg:
+                    _log.debug("DAVE decrypt: no decryptor yet uid=%d (handshake pending)", user_id)
+                elif "DuplicateNonce" in error_message:
                     # Replay protection — benign, discard silently.
-                    _log.info("DAVE decrypt: duplicate nonce uid=%d", user_id)
+                    _log.debug("DAVE decrypt: duplicate nonce uid=%d", user_id)
                 else:
                     # DecryptionFailed or unknown — worth knowing about.
                     _log.warning("DAVE decrypt failed uid=%d: %s", user_id, exc)
@@ -249,7 +249,7 @@ class DaveSession:
         welcome completes).  ``True`` only if passthrough mode is active
         *and* a decryptor exists.
         """
-        return self._s.can_passthrough(user_id)
+        return self._davey_session.can_passthrough(user_id)
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -258,12 +258,12 @@ class DaveSession:
 
         ``expiry_secs`` is ignored when ``enabled=False``.
         """
-        self._s.set_passthrough_mode(enabled, expiry_secs)
+        self._davey_session.set_passthrough_mode(enabled, expiry_secs)
         _log.debug("DAVE: passthrough_mode=%s expiry=%ds", enabled, expiry_secs)
 
     def reset(self) -> None:
         """Full reset — clears MLS group state and all decryptors."""
-        self._s.reset()
+        self._davey_session.reset()
         self._decrypt_ok.clear()
         self._decrypt_fail.clear()
         _log.debug("DAVE: session reset")
@@ -279,7 +279,7 @@ class DaveSession:
         Called on ``DAVE_PREPARE_EPOCH(epoch=1)`` to handle group recreation.
         After this call: ``epoch=None``, ``ready=False``.
         """
-        self._s.reinit(protocol_version, user_id, channel_id)
+        self._davey_session.reinit(protocol_version, user_id, channel_id)
         self._decrypt_ok.clear()
         self._decrypt_fail.clear()
         _log.debug(
@@ -297,7 +297,7 @@ class DaveSession:
         Never raises — safe to call at any point in the session lifecycle.
         """
         # get_encryption_stats() always returns an object (never raises).
-        enc = self._s.get_encryption_stats()
+        encryption_stats = self._davey_session.get_encryption_stats()
         total_ok = sum(self._decrypt_ok.values())
         total_fail = sum(self._decrypt_fail.values())
         total = total_ok + total_fail
@@ -308,8 +308,8 @@ class DaveSession:
             "decrypt_ok": total_ok,
             "decrypt_fail": total_fail,
             "decrypt_rate": (total_ok / total) if total else None,
-            "encrypt_ok": enc.successes,
-            "encrypt_fail": enc.failures,
+            "encrypt_ok": encryption_stats.successes,
+            "encrypt_fail": encryption_stats.failures,
             "per_user_ok": dict(self._decrypt_ok),
             "per_user_fail": dict(self._decrypt_fail),
         }

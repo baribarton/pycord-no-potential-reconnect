@@ -1005,17 +1005,17 @@ class DiscordVoiceWebSocket:
         elif op == self.CLIENTS_CONNECT:
             # protocol.md §clients_connect (11): track expected MLS group members.
             user_ids = data.get("user_ids", [])
-            for uid in user_ids:
-                self.dave_known_user_ids.add(int(uid))
+            for user_id in user_ids:
+                self.dave_known_user_ids.add(int(user_id))
             _log.debug("DAVE: clients_connect user_ids=%s", user_ids)
             self.last_dave_op = op
 
         elif op == self.CLIENT_DISCONNECT:
             # protocol.md §client_disconnect (13): remove from expected set.
-            uid = data.get("user_id")
-            if uid is not None:
-                self.dave_known_user_ids.discard(int(uid))
-            _log.debug("DAVE: client_disconnect user_id=%s", uid)
+            user_id = data.get("user_id")
+            if user_id is not None:
+                self.dave_known_user_ids.discard(int(user_id))
+            _log.debug("DAVE: client_disconnect user_id=%s", user_id)
             self.last_dave_op = op
 
         elif op == self.DAVE_PREPARE_TRANSITION:
@@ -1029,15 +1029,15 @@ class DiscordVoiceWebSocket:
                 transition_id,
                 protocol_version,
             )
-            vc = self._connection
-            vc.dave_pending_transitions[transition_id] = protocol_version
-            if protocol_version == 0 and vc.dave_session:
+            voice_client = self._connection
+            voice_client.dave_pending_transitions[transition_id] = protocol_version
+            if protocol_version == 0 and voice_client.dave_session:
                 # Downgrade path: enable passthrough so we can receive
                 # un-encrypted frames from non-DAVE clients.
-                vc.dave_session.set_passthrough_mode(True, 120)
+                voice_client.dave_session.set_passthrough_mode(True, 120)
             if transition_id == 0:
                 # Initialisation transition: execute immediately without waiting.
-                await vc._execute_transition(transition_id)
+                await voice_client._execute_transition(transition_id)
             else:
                 await self.send_transition_ready(transition_id)
 
@@ -1078,35 +1078,35 @@ class DiscordVoiceWebSocket:
             return
 
         self.seq_ack = struct.unpack_from(">H", msg, 0)[0]
-        op = msg[2]
-        self.last_dave_op = op
-        vc = self._connection
+        binary_opcode = msg[2]
+        self.last_dave_op = binary_opcode
+        voice_client = self._connection
 
-        if op == self.MLS_EXTERNAL_SENDER:
+        if binary_opcode == self.MLS_EXTERNAL_SENDER:
             # protocol.md §mls_external_sender (25):
             # [seq16][op][ExternalSender]  →  payload = msg[3:]
-            if vc.dave_session is None:
+            if voice_client.dave_session is None:
                 _log.warning("DAVE: MLS_EXTERNAL_SENDER but no dave_session, ignoring")
                 return
             try:
-                vc.dave_session.set_external_sender(msg[3:])
+                voice_client.dave_session.set_external_sender(msg[3:])
             except ValueError as exc:
                 _log.error("DAVE: set_external_sender failed: %s", exc)
 
-        elif op == self.MLS_PROPOSALS:
+        elif binary_opcode == self.MLS_PROPOSALS:
             # protocol.md §mls_proposals (27):
             # [seq16][op][uint8 op_type][proposals]
             #   op_type 0 = append, 1 = revoke
             if len(msg) < 4:
                 _log.warning("DAVE: MLS_PROPOSALS too short (%d bytes)", len(msg))
                 return
-            if vc.dave_session is None:
+            if voice_client.dave_session is None:
                 _log.warning("DAVE: MLS_PROPOSALS but no dave_session, ignoring")
                 return
             operation_type = msg[3]
             proposal_data = msg[4:]
             try:
-                result = vc.dave_session.process_proposals(operation_type, proposal_data)
+                result = voice_client.dave_session.process_proposals(operation_type, proposal_data)
             except ValueError as exc:
                 _log.error("DAVE: process_proposals failed: %s", exc)
                 return
@@ -1122,13 +1122,13 @@ class DiscordVoiceWebSocket:
                     welcome is not None,
                 )
 
-        elif op == self.MLS_ANNOUNCE_COMMIT_TRANSITION:
+        elif binary_opcode == self.MLS_ANNOUNCE_COMMIT_TRANSITION:
             # protocol.md §mls_announce_commit_transition (29):
             # [seq16][op][uint16 BE transition_id][MLS commit]
             if len(msg) < 5:
                 _log.warning("DAVE: MLS_ANNOUNCE_COMMIT_TRANSITION too short (%d bytes)", len(msg))
                 return
-            if vc.dave_session is None:
+            if voice_client.dave_session is None:
                 _log.debug("DAVE: MLS_ANNOUNCE_COMMIT_TRANSITION but no dave_session, ignoring")
                 return
             transition_id = struct.unpack_from(">H", msg, 3)[0]
@@ -1139,7 +1139,7 @@ class DiscordVoiceWebSocket:
                 len(commit),
             )
             try:
-                vc.dave_session.process_commit(commit)
+                voice_client.dave_session.process_commit(commit)
             except ValueError as exc:
                 _log.warning(
                     "DAVE: process_commit failed (transition_id=%d): %s",
@@ -1148,28 +1148,28 @@ class DiscordVoiceWebSocket:
                 )
                 await self._recover_from_invalid_commit(transition_id)
                 return
-            if vc.dave_session.ready:
-                await vc._drain_dave_queue()
+            if voice_client.dave_session.ready:
+                await voice_client._drain_dave_queue()
             # Enable passthrough so un-encrypted frames sent during the
             # epoch-transition window are accepted rather than dropped.
             # (The sending client briefly emits unencrypted audio while its
             # own MLS state catches up — e.g. on SSRC change / reconnect.)
-            vc.dave_session.set_passthrough_mode(True, 10)
+            voice_client.dave_session.set_passthrough_mode(True, 10)
             # Register this transition_id so DAVE_EXECUTE_TRANSITION (op 22)
             # can match it.  Op 22 carries the same tid as op 29, but op 21
             # is NOT sent to the new member, so we pre-register it here.
-            vc.dave_pending_transitions.setdefault(transition_id, vc.dave_protocol_version)
+            voice_client.dave_pending_transitions.setdefault(transition_id, voice_client.dave_protocol_version)
             # Signal the gateway that we have applied the commit and are using
             # the new epoch's keys.  Required per protocol.md §dave_transition_ready.
             await self.send_transition_ready(transition_id)
 
-        elif op == self.MLS_WELCOME:
+        elif binary_opcode == self.MLS_WELCOME:
             # protocol.md §mls_welcome (30):
             # [seq16][op][uint16 BE transition_id][MLS welcome]
             if len(msg) < 5:
                 _log.warning("DAVE: MLS_WELCOME too short (%d bytes)", len(msg))
                 return
-            if vc.dave_session is None:
+            if voice_client.dave_session is None:
                 _log.debug("DAVE: MLS_WELCOME but no dave_session, ignoring")
                 return
             transition_id = struct.unpack_from(">H", msg, 3)[0]
@@ -1180,7 +1180,7 @@ class DiscordVoiceWebSocket:
                 len(welcome),
             )
             try:
-                vc.dave_session.process_welcome(welcome)
+                voice_client.dave_session.process_welcome(welcome)
             except ValueError as exc:
                 _log.warning(
                     "DAVE: process_welcome failed (transition_id=%d): %s",
@@ -1189,18 +1189,18 @@ class DiscordVoiceWebSocket:
                 )
                 await self._recover_from_invalid_commit(transition_id)
                 return
-            if vc.dave_session.ready:
-                await vc._drain_dave_queue()
+            if voice_client.dave_session.ready:
+                await voice_client._drain_dave_queue()
             # Enable passthrough for the epoch-transition window.
-            vc.dave_session.set_passthrough_mode(True, 10)
+            voice_client.dave_session.set_passthrough_mode(True, 10)
             # Pre-register transition_id so op 22 can match it (new-member path).
-            vc.dave_pending_transitions.setdefault(transition_id, vc.dave_protocol_version)
+            voice_client.dave_pending_transitions.setdefault(transition_id, voice_client.dave_protocol_version)
             # Signal the gateway that we have applied the welcome and are using
             # the new epoch's keys.  Required per protocol.md §dave_transition_ready.
             await self.send_transition_ready(transition_id)
 
         else:
-            _log.debug("DAVE: unknown binary opcode %d (%d bytes), ignoring", op, len(msg))
+            _log.debug("DAVE: unknown binary opcode %d (%d bytes), ignoring", binary_opcode, len(msg))
 
     async def _recover_from_invalid_commit(self, transition_id: int) -> None:
         """Notify the server of a bad commit/welcome and reset local DAVE state.
@@ -1211,9 +1211,9 @@ class DiscordVoiceWebSocket:
         await self.send_as_json(
             {"op": self.MLS_INVALID_COMMIT_WELCOME, "d": {"transition_id": transition_id}}
         )
-        vc = self._connection
-        if vc.dave_session is not None:
-            vc.dave_session.reset()
+        voice_client = self._connection
+        if voice_client.dave_session is not None:
+            voice_client.dave_session.reset()
         _log.warning(
             "DAVE: MLS_INVALID_COMMIT_WELCOME sent for transition_id=%d, session reset",
             transition_id,

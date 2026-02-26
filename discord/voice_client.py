@@ -614,7 +614,7 @@ class VoiceClient(VoiceProtocol):
         target_ws = ws if ws is not None else self.ws
         await target_ws.send_binary(target_ws.MLS_KEY_PACKAGE, key_package)
         _log.debug(
-            "DAVE: reinit_dave_session version=%d uid=%d channel=%d kp=%d bytes",
+            "DAVE: reinit_dave_session version=%d uid=%d channel=%d key_package=%d bytes",
             self.dave_protocol_version,
             user_id,
             channel_id,
@@ -680,20 +680,20 @@ class VoiceClient(VoiceProtocol):
                 continue
             packets = self._dave_raw_queue.pop(ssrc, [])
             drained = 0
-            for pkt in packets:
-                pkt.user_id = user_id
-                raw = pkt.decrypted_data
-                dec = self.dave_session.decrypt_opus(user_id, raw)
-                if dec is None:
+            for queued_packet in packets:
+                queued_packet.user_id = user_id
+                transport_decrypted = queued_packet.decrypted_data
+                dave_decrypted = self.dave_session.decrypt_opus(user_id, transport_decrypted)
+                if dave_decrypted is None:
                     continue
-                if dec == raw:
+                if dave_decrypted == transport_decrypted:
                     # Passthrough: davey returned the blob unchanged — it's a
                     # DAVE-framed unencrypted packet, not pure opus.  Drop it.
                     continue
-                pkt.decrypted_data = dec
-                if pkt.decrypted_data == b"\xf8\xff\xfe":
+                queued_packet.decrypted_data = dave_decrypted
+                if queued_packet.decrypted_data == b"\xf8\xff\xfe":
                     continue
-                self.decoder.decode(pkt)
+                self.decoder.decode(queued_packet)
                 drained += 1
             _log.debug(
                 "DAVE: _drain_dave_queue ssrc=%d uid=%d drained=%d/%d",
@@ -955,29 +955,29 @@ class VoiceClient(VoiceProtocol):
                     "DAVE: lazy drain %d queued frames ssrc=%d uid=%d",
                     len(queued), ssrc, user_id,
                 )
-                for q_pkt in queued:
-                    q_pkt.user_id = user_id
-                    q_raw = q_pkt.decrypted_data
-                    q_dec = self.dave_session.decrypt_opus(user_id, q_raw)
-                    if q_dec is None:
+                for queued_packet in queued:
+                    queued_packet.user_id = user_id
+                    transport_decrypted = queued_packet.decrypted_data
+                    dave_decrypted = self.dave_session.decrypt_opus(user_id, transport_decrypted)
+                    if dave_decrypted is None:
                         continue
-                    if q_dec == q_raw:
+                    if dave_decrypted == transport_decrypted:
                         # Passthrough: DAVE-framed unencrypted packet, not opus.
                         continue
-                    q_pkt.decrypted_data = q_dec
-                    if q_pkt.decrypted_data == b"\xf8\xff\xfe":
+                    queued_packet.decrypted_data = dave_decrypted
+                    if queued_packet.decrypted_data == b"\xf8\xff\xfe":
                         continue
-                    self.decoder.decode(q_pkt)
+                    self.decoder.decode(queued_packet)
 
             # DAVE decrypt the current frame.
-            raw = data.decrypted_data
-            decrypted = self.dave_session.decrypt_opus(user_id, raw)
-            if decrypted is None:
+            transport_decrypted = data.decrypted_data
+            dave_decrypted = self.dave_session.decrypt_opus(user_id, transport_decrypted)
+            if dave_decrypted is None:
                 return  # drop: wrong key / replay / decryptor not yet active
-            if decrypted == raw:
+            if dave_decrypted == transport_decrypted:
                 # Passthrough: DAVE-framed unencrypted packet, not opus.  Drop.
                 return
-            data.decrypted_data = decrypted
+            data.decrypted_data = dave_decrypted
         # ──────────────────────────────────────────────────────────────────
 
         if data.decrypted_data == b"\xf8\xff\xfe":  # Frame of silence
