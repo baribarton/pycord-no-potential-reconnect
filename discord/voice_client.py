@@ -51,6 +51,12 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
 from . import opus, utils
 from .backoff import ExponentialBackoff
+from .dave_session import (
+    DAVE_QUEUE_MAX_PER_SSRC,
+    DAVE_QUEUE_MAX_TOTAL,
+    DaveSession,
+    has_dave,
+)
 from .errors import ClientException, ConnectionClosed
 from .gateway import *
 from .player import AudioPlayer, AudioSource
@@ -266,6 +272,16 @@ class VoiceClient(VoiceProtocol):
         self.starting_time = None
         self.stopping_time = None
         self.temp_queued_data: dict[int, list] = {}
+
+        # DAVE E2EE session state.
+        # dave_session is None when DAVE is inactive (non-E2EE channel or davey not installed).
+        self.dave_session: DaveSession | None = None
+        self.dave_protocol_version: int = 0
+        # Maps transition_id → protocol_version for pending transitions.
+        self.dave_pending_transitions: dict[int, int] = {}
+        # Transport-decrypted packets queued while ssrc→user_id is not yet known.
+        # Keyed by ssrc; drained lazily in unpack_audio when the mapping appears.
+        self._dave_raw_queue: dict[int, list] = {}
 
     warn_nacl = not has_nacl
     supported_modes: tuple[SupportedModes, ...] = (
@@ -565,6 +581,128 @@ class VoiceClient(VoiceProtocol):
         """Indicates if the voice client is connected to voice."""
         return self._connected.is_set()
 
+    # ── DAVE E2EE ────────────────────────────────────────────────────────────
+
+    async def reinit_dave_session(self, ws=None) -> None:
+        """Create or reinitialise the DAVE MLS session and send a fresh key package.
+
+        Called by the gateway on:
+        * SESSION_DESCRIPTION with ``dave_protocol_version > 0``
+        * DAVE_PREPARE_EPOCH with ``epoch == 1``
+
+        ``ws`` is the active :class:`DiscordVoiceWebSocket`.  It must be
+        supplied during the initial handshake because ``self.ws`` has not been
+        assigned yet at that point.  After the handshake completes it falls
+        back to ``self.ws``.
+        """
+        if not has_dave:
+            raise RuntimeError(
+                "E2EE voice requires the 'davey' library. "
+                "Install it with: pip install davey"
+            )
+        user_id = self.user.id
+        channel_id = self.channel.id
+        if self.dave_session is None:
+            self.dave_session = DaveSession(
+                self.dave_protocol_version, user_id, channel_id
+            )
+        else:
+            self.dave_session.reinit(self.dave_protocol_version, user_id, channel_id)
+
+        # Op 26 MLS_KEY_PACKAGE is C→S binary: [op][key_package_bytes]
+        key_package = self.dave_session.get_key_package()
+        target_ws = ws if ws is not None else self.ws
+        await target_ws.send_binary(target_ws.MLS_KEY_PACKAGE, key_package)
+        _log.debug(
+            "DAVE: reinit_dave_session version=%d uid=%d channel=%d kp=%d bytes",
+            self.dave_protocol_version,
+            user_id,
+            channel_id,
+            len(key_package),
+        )
+
+    async def _execute_transition(self, transition_id: int) -> None:
+        """Execute a previously announced DAVE protocol transition.
+
+        Called by the gateway on DAVE_PREPARE_TRANSITION (transition_id=0)
+        or DAVE_EXECUTE_TRANSITION.
+        """
+        protocol_version = self.dave_pending_transitions.pop(transition_id, None)
+        if protocol_version is None:
+            # Normal for the new-member path: op 22 arrives after op 29/30 but
+            # op 21 was never sent to us (only to existing members).
+            # The transition_id is now pre-registered in received_binary_message
+            # so this branch should be rare; log at DEBUG only.
+            _log.debug(
+                "DAVE: _execute_transition for unknown transition_id=%d "
+                "(op 21 not received — new-member or re-join path)",
+                transition_id,
+            )
+            return
+
+        _log.debug(
+            "DAVE: execute_transition id=%d protocol_version=%d",
+            transition_id,
+            protocol_version,
+        )
+        if protocol_version == 0:
+            # Transition to non-DAVE: tear down the MLS session.
+            if self.dave_session is not None:
+                self.dave_session.reset()
+                self.dave_session = None
+            self.dave_protocol_version = 0
+            self._dave_raw_queue.clear()
+            _log.info("DAVE: transitioned out of E2EE (protocol_version=0)")
+        else:
+            # Transition to (or within) DAVE.
+            # Session was already recreated in reinit_dave_session (PREPARE_EPOCH).
+            # Welcome or commit (ops 29/30) will complete it.
+            self.dave_protocol_version = protocol_version
+            _log.info(
+                "DAVE: executing transition to protocol_version=%d (session.ready=%s)",
+                protocol_version,
+                self.dave_session.ready if self.dave_session else "N/A",
+            )
+
+    async def _drain_dave_queue(self) -> None:
+        """Drain queued DAVE packets for SSRCs whose user_id mapping is now known.
+
+        Called after an MLS welcome or commit makes the session ready.
+        Packets whose SSRC is not yet mapped to a user_id are left in the
+        queue and drained lazily in ``unpack_audio`` when the next packet
+        arrives for that SSRC.
+        """
+        if not self._dave_raw_queue or self.dave_session is None or not self.decoder:
+            return
+        for ssrc in list(self._dave_raw_queue.keys()):
+            user_id = self.ws.ssrc_map.get(ssrc, {}).get("user_id")
+            if user_id is None:
+                continue
+            packets = self._dave_raw_queue.pop(ssrc, [])
+            drained = 0
+            for pkt in packets:
+                pkt.user_id = user_id
+                raw = pkt.decrypted_data
+                dec = self.dave_session.decrypt_opus(user_id, raw)
+                if dec is None:
+                    continue
+                if dec == raw:
+                    # Passthrough: davey returned the blob unchanged — it's a
+                    # DAVE-framed unencrypted packet, not pure opus.  Drop it.
+                    continue
+                pkt.decrypted_data = dec
+                if pkt.decrypted_data == b"\xf8\xff\xfe":
+                    continue
+                self.decoder.decode(pkt)
+                drained += 1
+            _log.debug(
+                "DAVE: _drain_dave_queue ssrc=%d uid=%d drained=%d/%d",
+                ssrc,
+                user_id,
+                drained,
+                len(packets),
+            )
+
     # audio related
 
     def _get_voice_packet(self, data):
@@ -789,6 +927,58 @@ class VoiceClient(VoiceProtocol):
             return
 
         data = RawData(data, self)
+
+        # ── DAVE E2EE decrypt ─────────────────────────────────────────────
+        if self.dave_session is not None:
+            ssrc = data.ssrc
+            user_id = self.ws.ssrc_map.get(ssrc, {}).get("user_id")
+
+            if user_id is None:
+                # ssrc→user_id not yet known: hold the transport-decrypted frame.
+                total = sum(len(v) for v in self._dave_raw_queue.values())
+                if total >= DAVE_QUEUE_MAX_TOTAL:
+                    # Global cap: evict oldest packet from the largest backlog.
+                    evict = max(self._dave_raw_queue, key=lambda s: len(self._dave_raw_queue[s]))
+                    self._dave_raw_queue[evict].pop(0)
+                    if not self._dave_raw_queue[evict]:
+                        del self._dave_raw_queue[evict]
+                per = self._dave_raw_queue.setdefault(ssrc, [])
+                if len(per) >= DAVE_QUEUE_MAX_PER_SSRC:
+                    per.pop(0)  # per-ssrc cap
+                per.append(data)
+                return
+
+            # ssrc→user_id now known: drain any frames queued for this ssrc first.
+            if ssrc in self._dave_raw_queue:
+                queued = self._dave_raw_queue.pop(ssrc)
+                _log.debug(
+                    "DAVE: lazy drain %d queued frames ssrc=%d uid=%d",
+                    len(queued), ssrc, user_id,
+                )
+                for q_pkt in queued:
+                    q_pkt.user_id = user_id
+                    q_raw = q_pkt.decrypted_data
+                    q_dec = self.dave_session.decrypt_opus(user_id, q_raw)
+                    if q_dec is None:
+                        continue
+                    if q_dec == q_raw:
+                        # Passthrough: DAVE-framed unencrypted packet, not opus.
+                        continue
+                    q_pkt.decrypted_data = q_dec
+                    if q_pkt.decrypted_data == b"\xf8\xff\xfe":
+                        continue
+                    self.decoder.decode(q_pkt)
+
+            # DAVE decrypt the current frame.
+            raw = data.decrypted_data
+            decrypted = self.dave_session.decrypt_opus(user_id, raw)
+            if decrypted is None:
+                return  # drop: wrong key / replay / decryptor not yet active
+            if decrypted == raw:
+                # Passthrough: DAVE-framed unencrypted packet, not opus.  Drop.
+                return
+            data.decrypted_data = decrypted
+        # ──────────────────────────────────────────────────────────────────
 
         if data.decrypted_data == b"\xf8\xff\xfe":  # Frame of silence
             return
