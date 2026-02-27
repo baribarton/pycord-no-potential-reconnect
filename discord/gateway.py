@@ -907,7 +907,7 @@ class DiscordVoiceWebSocket:
         await self.send_as_json(payload)
 
     @classmethod
-    async def from_client(cls, client, *, resume=False, hook=None):
+    async def from_client(cls, client, *, resume=False, hook=None, seq_ack: int = -1):
         """Creates a voice websocket for the :class:`VoiceClient`."""
         gateway = f"wss://{client.endpoint}/?v=8"
         http = client._state.http
@@ -917,6 +917,11 @@ class DiscordVoiceWebSocket:
         ws._connection = client
         ws._max_heartbeat_timeout = 60.0
         ws.thread_id = threading.get_ident()
+        # Carry the caller's sequence counter into the new ws object so the
+        # RESUME payload sends the correct seq_ack and the gateway replays
+        # exactly the binary frames (DAVE_PREPARE_EPOCH, MLS commits/welcomes)
+        # that were missed during the disconnect window.
+        ws.seq_ack = seq_ack
 
         if resume:
             await ws.resume()
@@ -1203,10 +1208,13 @@ class DiscordVoiceWebSocket:
             _log.debug("DAVE: unknown binary opcode %d (%d bytes), ignoring", binary_opcode, len(msg))
 
     async def _recover_from_invalid_commit(self, transition_id: int) -> None:
-        """Notify the server of a bad commit/welcome and reset local DAVE state.
+        """Notify the server of a bad commit/welcome, reset local DAVE state, and reconnect.
 
-        Sends MLS_INVALID_COMMIT_WELCOME (op 31, JSON C→S) then resets the
-        session so the next DAVE_PREPARE_EPOCH will create a fresh MLS group.
+        Sends MLS_INVALID_COMMIT_WELCOME (op 31, JSON C→S), resets the session,
+        then closes the voice WebSocket (code 4000) to force a full reconnect.
+        Closing is necessary because Discord does not reliably send a new
+        DAVE_PREPARE_EPOCH after receiving op 31 — without a reconnect the bot
+        would sit indefinitely with epoch=None and all decryption failing.
         """
         await self.send_as_json(
             {"op": self.MLS_INVALID_COMMIT_WELCOME, "d": {"transition_id": transition_id}}
@@ -1214,10 +1222,17 @@ class DiscordVoiceWebSocket:
         voice_client = self._connection
         if voice_client.dave_session is not None:
             voice_client.dave_session.reset()
+        # Reset the reconnect backoff before closing.  This is a DAVE protocol
+        # error, not a network failure — the server was reachable and the WS
+        # handshake succeeded.  Without the reset, rapid DAVE failures accumulate
+        # into 100-second waits via the standard network-outage backoff.
+        voice_client._reset_reconnect_backoff()
         _log.warning(
-            "DAVE: MLS_INVALID_COMMIT_WELCOME sent for transition_id=%d, session reset",
+            "DAVE: MLS_INVALID_COMMIT_WELCOME sent for transition_id=%d, session reset — "
+            "closing voice WS to force reconnect",
             transition_id,
         )
+        await self.close(4000)
 
     async def initial_connection_v1(self, data):
         state = self._connection

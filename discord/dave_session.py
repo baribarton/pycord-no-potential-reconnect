@@ -231,6 +231,10 @@ class DaveSession:
                 elif "DuplicateNonce" in error_message:
                     # Replay protection — benign, discard silently.
                     _log.debug("DAVE decrypt: duplicate nonce uid=%d", user_id)
+                elif "NoValidCryptorFound" in error_message:
+                    # Expected during epoch-transition window: remote is still
+                    # encrypting with the previous epoch's keys.  Benign drop.
+                    _log.debug("DAVE decrypt: no valid cryptor uid=%d (epoch transition)", user_id)
                 else:
                     # DecryptionFailed or unknown — worth knowing about.
                     _log.warning("DAVE decrypt failed uid=%d: %s", user_id, exc)

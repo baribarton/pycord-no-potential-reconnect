@@ -282,6 +282,10 @@ class VoiceClient(VoiceProtocol):
         # Transport-decrypted packets queued while ssrc→user_id is not yet known.
         # Keyed by ssrc; drained lazily in unpack_audio when the mapping appears.
         self._dave_raw_queue: dict[int, list] = {}
+        # Shared with poll_voice_ws so DAVE recovery can reset it.  DAVE-triggered
+        # reconnects are protocol errors, not network failures — resetting here
+        # prevents backoff from accumulating to 100-second waits.
+        self._poll_backoff: ExponentialBackoff = ExponentialBackoff()
 
     warn_nacl = not has_nacl
     supported_modes: tuple[SupportedModes, ...] = (
@@ -372,6 +376,12 @@ class VoiceClient(VoiceProtocol):
         self._voice_state_complete.clear()
         self._voice_server_complete.clear()
         self._handshaking = True
+        # Clear stale DAVE state from any previous session.
+        # Transition IDs must not collide with IDs in the new session, and
+        # queued packets were encrypted with the old session's epoch keys and
+        # cannot be decrypted in a new session.
+        self.dave_pending_transitions.clear()
+        self._dave_raw_queue.clear()
         _log.info(
             "Starting voice handshake... (connection attempt %d)", self._connections + 1
         )
@@ -431,6 +441,7 @@ class VoiceClient(VoiceProtocol):
 
         if self._runner is MISSING:
             self._runner = self.loop.create_task(self.poll_voice_ws(reconnect))
+            self._runner.add_done_callback(self._on_poll_voice_ws_done)
 
     async def potential_reconnect(self) -> bool:
         # Attempt to stop the player thread from playing early
@@ -478,7 +489,7 @@ class VoiceClient(VoiceProtocol):
         return float("inf") if not ws else ws.average_latency
 
     async def poll_voice_ws(self, reconnect: bool) -> None:
-        backoff = ExponentialBackoff()
+        self._poll_backoff = ExponentialBackoff()
         while True:
             try:
                 await self.ws.poll_event()
@@ -514,23 +525,56 @@ class VoiceClient(VoiceProtocol):
                     if exc.code == 4015:
                         _log.info("Disconnected from voice, trying to resume...")
 
+                        # Preserve SSRC→user_id mappings from the old ws.
+                        # SPEAKING events (op 5) that originally populated
+                        # ssrc_map are NOT replayed by the gateway during a
+                        # buffered RESUME, so without this the new ws object
+                        # starts with an empty ssrc_map and existing users'
+                        # UDP packets can't be attributed to a user_id.
+                        _old_ssrc_map = dict(self.ws.ssrc_map)
+                        _old_seq_ack = self.ws.seq_ack
+
                         try:
-                            await self.ws.resume()
+                            # Open a fresh socket and send RESUME (op 7) with the
+                            # previous session's seq_ack.  The gateway replays any
+                            # buffered binary frames (DAVE_PREPARE_EPOCH, MLS
+                            # commits/welcomes) that arrived during the disconnect
+                            # window, keeping DAVE state in sync without a full
+                            # re-handshake.  Calling ws.resume() directly on the
+                            # already-closed socket raises ConnectionResetError
+                            # ("Cannot write to closing transport"); from_client()
+                            # establishes the new TCP/WS connection first.
+                            self.ws = await DiscordVoiceWebSocket.from_client(
+                                self, resume=True, seq_ack=_old_seq_ack
+                            )
                         except asyncio.TimeoutError:
                             _log.info(
-                                "Could not resume the voice connection... Disconnection..."
+                                "Could not resume the voice connection... Disconnecting..."
                             )
                             if self._connected.is_set():
                                 await self.disconnect(force=True)
+                        except Exception:
+                            _log.exception(
+                                "Unexpected error during voice RESUME; "
+                                "falling through to full reconnect."
+                            )
                         else:
-                            _log.info("Successfully resumed voice connection")
+                            # Restore the ssrc_map so existing speakers keep
+                            # working immediately; new SPEAKING events will
+                            # update it as they arrive.
+                            self.ws.ssrc_map.update(_old_ssrc_map)
+                            _log.info(
+                                "Successfully resumed voice connection "
+                                "(restored %d ssrc_map entries)",
+                                len(_old_ssrc_map),
+                            )
                             continue
 
                 if not reconnect:
                     await self.disconnect()
                     raise
 
-                retry = backoff.delay()
+                retry = self._poll_backoff.delay()
                 _log.exception(
                     "Disconnected from voice... Reconnecting in %.2fs.", retry
                 )
@@ -583,6 +627,32 @@ class VoiceClient(VoiceProtocol):
 
     # ── DAVE E2EE ────────────────────────────────────────────────────────────
 
+    def _on_poll_voice_ws_done(self, task: "asyncio.Task[None]") -> None:
+        """Log any exception that escapes poll_voice_ws to prevent silent crashes.
+
+        asyncio tasks swallow unhandled exceptions until the task object is
+        garbage-collected (or explicitly checked).  This callback fires
+        immediately on task completion so crashes are always visible in the log.
+        """
+        if not task.cancelled() and task.exception() is not None:
+            _log.error(
+                "poll_voice_ws task ended with an unhandled exception; "
+                "voice connection may be lost.",
+                exc_info=task.exception(),
+            )
+
+    def _reset_reconnect_backoff(self) -> None:
+        """Reset the poll_voice_ws backoff after a DAVE-triggered reconnect.
+
+        DAVE protocol failures (invalid commit/welcome) are not network failures.
+        The server was reachable and the WS handshake succeeded; only the MLS
+        layer failed.  Resetting here keeps DAVE recovery retries on the order
+        of seconds rather than accumulating into the same 100-second delays used
+        for genuine network outages.
+        """
+        self._poll_backoff = ExponentialBackoff()
+        _log.debug("DAVE: reconnect backoff reset")
+
     async def reinit_dave_session(self, ws=None) -> None:
         """Create or reinitialise the DAVE MLS session and send a fresh key package.
 
@@ -629,13 +699,17 @@ class VoiceClient(VoiceProtocol):
         """
         protocol_version = self.dave_pending_transitions.pop(transition_id, None)
         if protocol_version is None:
-            # Normal for the new-member path: op 22 arrives after op 29/30 but
-            # op 21 was never sent to us (only to existing members).
-            # The transition_id is now pre-registered in received_binary_message
-            # so this branch should be rare; log at DEBUG only.
+            # Two known causes:
+            # 1. New-member path: op 22 arrives after op 29/30 but op 21 was
+            #    never sent to us (only to existing members).  Pre-registration
+            #    in received_binary_message handles this for the normal case.
+            # 2. Post-RESUME: the gateway re-sends op 22 for the last active
+            #    transition to bring the client up to date, but the client
+            #    already executed that transition before the disconnect.
+            # In both cases the transition has already been applied; skip.
             _log.debug(
-                "DAVE: _execute_transition for unknown transition_id=%d "
-                "(op 21 not received — new-member or re-join path)",
+                "DAVE: _execute_transition for already-executed or "
+                "unannounced transition_id=%d — skipping",
                 transition_id,
             )
             return
