@@ -70,11 +70,8 @@ class DaveSession:
         self._davey_session: _davey.DaveSession = _davey.DaveSession(
             protocol_version, user_id, channel_id
         )
-        # Protects decrypt_opus from concurrent calls: recv_audio thread and
-        # the event-loop thread (_drain_dave_queue) can both call decrypt().
+        # recv_audio and _drain_dave_queue can both call decrypt() concurrently.
         self._lock = threading.Lock()
-        # Track decrypt outcomes ourselves — get_decryption_stats() raises
-        # ValueError for unknown users, so we can't use it safely in a loop.
         self._decrypt_ok: dict[int, int] = {}
         self._decrypt_fail: dict[int, int] = {}
         _log.debug(
@@ -232,16 +229,13 @@ class DaveSession:
                     # Replay protection — benign, discard silently.
                     _log.debug("DAVE decrypt: duplicate nonce uid=%d", user_id)
                 elif "NoValidCryptorFound" in error_message:
-                    # Expected during epoch-transition window: remote is still
-                    # encrypting with the previous epoch's keys.  Benign drop.
                     _log.debug("DAVE decrypt: no valid cryptor uid=%d (epoch transition)", user_id)
                 else:
                     # DecryptionFailed or unknown — worth knowing about.
                     _log.warning("DAVE decrypt failed uid=%d: %s", user_id, exc)
                 return None
             except Exception as exc:
-                # Unexpected error from the native library — drop the packet
-                # rather than crashing the recv_audio thread.
+                # Drop rather than crash the recv thread.
                 self._decrypt_fail[user_id] = self._decrypt_fail.get(user_id, 0) + 1
                 _log.error("DAVE decrypt unexpected error uid=%d: %s", user_id, exc)
                 return None
@@ -381,7 +375,6 @@ class FakeDaveSession:
         operation_type: int,
         data: bytes,
     ) -> Optional[tuple[bytes, Optional[bytes]]]:
-        # Simulate producing a commit + welcome so callers exercise that path.
         return (b"fake_commit", b"fake_welcome")
 
     def process_commit(self, commit: bytes) -> None:

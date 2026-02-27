@@ -273,18 +273,13 @@ class VoiceClient(VoiceProtocol):
         self.stopping_time = None
         self.temp_queued_data: dict[int, list] = {}
 
-        # DAVE E2EE session state.
-        # dave_session is None when DAVE is inactive (non-E2EE channel or davey not installed).
+        # None when DAVE is inactive (non-E2EE channel or davey not installed).
         self.dave_session: DaveSession | None = None
         self.dave_protocol_version: int = 0
         # Maps transition_id → protocol_version for pending transitions.
         self.dave_pending_transitions: dict[int, int] = {}
-        # Transport-decrypted packets queued while ssrc→user_id is not yet known.
-        # Keyed by ssrc; drained lazily in unpack_audio when the mapping appears.
+        # Packets queued while ssrc→user_id is unresolved; drained by unpack_audio.
         self._dave_raw_queue: dict[int, list] = {}
-        # Shared with poll_voice_ws so DAVE recovery can reset it.  DAVE-triggered
-        # reconnects are protocol errors, not network failures — resetting here
-        # prevents backoff from accumulating to 100-second waits.
         self._poll_backoff: ExponentialBackoff = ExponentialBackoff()
 
     warn_nacl = not has_nacl
@@ -376,10 +371,7 @@ class VoiceClient(VoiceProtocol):
         self._voice_state_complete.clear()
         self._voice_server_complete.clear()
         self._handshaking = True
-        # Clear stale DAVE state from any previous session.
-        # Transition IDs must not collide with IDs in the new session, and
-        # queued packets were encrypted with the old session's epoch keys and
-        # cannot be decrypted in a new session.
+        # Stale state from any previous session is invalid in a new one.
         self.dave_pending_transitions.clear()
         self._dave_raw_queue.clear()
         _log.info(
@@ -525,25 +517,11 @@ class VoiceClient(VoiceProtocol):
                     if exc.code == 4015:
                         _log.info("Disconnected from voice, trying to resume...")
 
-                        # Preserve SSRC→user_id mappings from the old ws.
-                        # SPEAKING events (op 5) that originally populated
-                        # ssrc_map are NOT replayed by the gateway during a
-                        # buffered RESUME, so without this the new ws object
-                        # starts with an empty ssrc_map and existing users'
-                        # UDP packets can't be attributed to a user_id.
+                        # SPEAKING events aren't replayed on RESUME; preserve the old mappings.
                         _old_ssrc_map = dict(self.ws.ssrc_map)
                         _old_seq_ack = self.ws.seq_ack
 
                         try:
-                            # Open a fresh socket and send RESUME (op 7) with the
-                            # previous session's seq_ack.  The gateway replays any
-                            # buffered binary frames (DAVE_PREPARE_EPOCH, MLS
-                            # commits/welcomes) that arrived during the disconnect
-                            # window, keeping DAVE state in sync without a full
-                            # re-handshake.  Calling ws.resume() directly on the
-                            # already-closed socket raises ConnectionResetError
-                            # ("Cannot write to closing transport"); from_client()
-                            # establishes the new TCP/WS connection first.
                             self.ws = await DiscordVoiceWebSocket.from_client(
                                 self, resume=True, seq_ack=_old_seq_ack
                             )
@@ -559,9 +537,6 @@ class VoiceClient(VoiceProtocol):
                                 "falling through to full reconnect."
                             )
                         else:
-                            # Restore the ssrc_map so existing speakers keep
-                            # working immediately; new SPEAKING events will
-                            # update it as they arrive.
                             self.ws.ssrc_map.update(_old_ssrc_map)
                             _log.info(
                                 "Successfully resumed voice connection "
@@ -695,18 +670,12 @@ class VoiceClient(VoiceProtocol):
         """Execute a previously announced DAVE protocol transition.
 
         Called by the gateway on DAVE_PREPARE_TRANSITION (transition_id=0)
-        or DAVE_EXECUTE_TRANSITION.
+        or DAVE_EXECUTE_TRANSITION.  If ``transition_id`` is not in
+        ``dave_pending_transitions`` the transition was already applied
+        (post-RESUME replay or new-member path) and the call is a no-op.
         """
         protocol_version = self.dave_pending_transitions.pop(transition_id, None)
         if protocol_version is None:
-            # Two known causes:
-            # 1. New-member path: op 22 arrives after op 29/30 but op 21 was
-            #    never sent to us (only to existing members).  Pre-registration
-            #    in received_binary_message handles this for the normal case.
-            # 2. Post-RESUME: the gateway re-sends op 22 for the last active
-            #    transition to bring the client up to date, but the client
-            #    already executed that transition before the disconnect.
-            # In both cases the transition has already been applied; skip.
             _log.debug(
                 "DAVE: _execute_transition for already-executed or "
                 "unannounced transition_id=%d — skipping",
@@ -728,9 +697,7 @@ class VoiceClient(VoiceProtocol):
             self._dave_raw_queue.clear()
             _log.info("DAVE: transitioned out of E2EE (protocol_version=0)")
         else:
-            # Transition to (or within) DAVE.
-            # Session was already recreated in reinit_dave_session (PREPARE_EPOCH).
-            # Welcome or commit (ops 29/30) will complete it.
+            # Session reinit already happened at PREPARE_EPOCH; commit/welcome completes it.
             self.dave_protocol_version = protocol_version
             _log.info(
                 "DAVE: executing transition to protocol_version=%d (session.ready=%s)",
@@ -761,8 +728,7 @@ class VoiceClient(VoiceProtocol):
                 if dave_decrypted is None:
                     continue
                 if dave_decrypted == transport_decrypted:
-                    # Passthrough: davey returned the blob unchanged — it's a
-                    # DAVE-framed unencrypted packet, not pure opus.  Drop it.
+                    # Passthrough: DAVE-framed unencrypted packet; drop it.
                     continue
                 queued_packet.decrypted_data = dave_decrypted
                 if queued_packet.decrypted_data == b"\xf8\xff\xfe":
@@ -1043,7 +1009,6 @@ class VoiceClient(VoiceProtocol):
                         continue
                     self.decoder.decode(queued_packet)
 
-            # DAVE decrypt the current frame.
             transport_decrypted = data.decrypted_data
             dave_decrypted = self.dave_session.decrypt_opus(user_id, transport_decrypted)
             if dave_decrypted is None:
