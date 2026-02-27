@@ -12,8 +12,6 @@ DAVE E2EE audio verification bot
 Fault types
 -----------
     commit_error    process_commit raises ValueError on the next op 29.
-    welcome_error   process_welcome raises ValueError on the next op 30.
-    decrypt_fail    decrypt_opus always returns None (all audio silently dropped).
     ip_timeout      discover_ip raises TimeoutError; WS is closed to trigger reconnect.
     ws_reconnect    Close the voice WS with code 4015 (simulates a server crash/resume).
 
@@ -41,17 +39,13 @@ import sys
 
 import discord
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-# Show INFO+ from our DAVE adapter so decrypt errors appear in the console.
-# pycord's own noisy loggers stay at WARNING.
+# DAVE adapter at DEBUG so session events are visible; pycord stays at WARNING.
 logging.basicConfig(
     level=logging.WARNING,
     format="%(levelname)-8s %(name)s: %(message)s",
 )
 logging.getLogger("discord.dave_session").setLevel(logging.DEBUG)
 logging.getLogger("discord.voice_client").setLevel(logging.DEBUG)
-
-# ── Config ────────────────────────────────────────────────────────────────────
 
 TOKEN: str = os.environ.get("DISCORD_TOKEN", "PASTE_TOKEN_HERE")
 MAX_RECORD_SECONDS: int = 120
@@ -108,25 +102,14 @@ def build_stats_embed(vc: discord.VoiceClient) -> discord.Embed:
     return embed
 
 
-# ── Bot ───────────────────────────────────────────────────────────────────────
-
-# voice_states is the only non-default intent we need.
-# message_content is NOT required for slash commands.
 intents = discord.Intents.default()
 intents.voice_states = True
 
 bot = discord.Bot(intents=intents)
 
-# guild_id → True while a recording is in progress (lets /record stop work)
-_recording: dict[int, bool] = {}
-
-# guild_id → FaultInjectingSession wrapper currently installed on that vc.
-# Used by /fault clear to know there is a wrapper to remove.
-_fault_sessions: dict[int, "FaultInjectingSession"] = {}
-
-# Saved original DiscordVoiceWebSocket.discover_ip so /fault clear can restore it
-# after an ip_timeout test.  None means the patch is not currently active.
-_original_discover_ip = None
+_recording: dict[int, bool] = {}  # guild_id → True while recording
+_fault_sessions: dict[int, "FaultInjectingSession"] = {}  # guild_id → active wrapper
+_original_discover_ip = None  # saved discover_ip; None when ip_timeout is not active
 
 
 @bot.event
@@ -136,8 +119,6 @@ async def on_ready():
     print(f"[dave-test] davey installed          : {has_dave}")
     print(f"[dave-test] MAX_DAVE_PROTOCOL_VERSION: {MAX_DAVE_PROTOCOL_VERSION}")
 
-
-# ── /record ───────────────────────────────────────────────────────────────────
 
 record_group = discord.SlashCommandGroup("record", "DAVE audio recording commands")
 
@@ -158,7 +139,6 @@ async def record_start(
 
     channel = ctx.author.voice.channel
 
-    # Defer immediately so Discord doesn't time out the interaction while we connect.
     await ctx.defer()
 
     vc: discord.VoiceClient
@@ -185,7 +165,6 @@ async def record_start(
     async def on_done(sink: discord.sinks.WaveSink, vc: discord.VoiceClient):
         _recording.pop(ctx.guild_id, None)
 
-        # ── Log DAVE stats to console ─────────────────────────────────────
         print(f"[dave-test] ── recording finished ──────────────────────────")
         print(f"[dave-test] dave_protocol_version : {vc.dave_protocol_version}")
         if vc.dave_session is not None:
@@ -195,7 +174,6 @@ async def record_start(
             print(f"[dave-test]   dave_session        : None (not an E2EE channel)")
         print(f"[dave-test] ─────────────────────────────────────────────────")
 
-        # ── Upload WAV files ──────────────────────────────────────────────
         files = []
         for uid, audio in sink.audio_data.items():
             audio.file.seek(0)
@@ -215,8 +193,7 @@ async def record_start(
 
     vc.start_recording(sink, on_done, vc)
 
-    # Sleep in 1s ticks so /record stop can interrupt.
-    for _ in range(seconds):
+    for _ in range(seconds):  # 1s ticks so /record stop can interrupt
         if ctx.guild_id not in _recording:
             break
         await asyncio.sleep(1)
@@ -238,8 +215,6 @@ async def record_stop(ctx: discord.ApplicationContext):
 bot.add_application_command(record_group)
 
 
-# ── /stats ────────────────────────────────────────────────────────────────────
-
 @bot.slash_command(name="stats", description="Show DAVE session stats for this connection")
 async def slash_stats(ctx: discord.ApplicationContext):
     if ctx.voice_client is None:
@@ -255,8 +230,6 @@ async def slash_stats(ctx: discord.ApplicationContext):
     print(f"[dave-test] ─────────────────────────────────────────────────────")
     await ctx.respond(embed=build_stats_embed(vc))
 
-
-# ── /dave ─────────────────────────────────────────────────────────────────────
 
 @bot.slash_command(name="dave", description="Check whether DAVE E2EE is active")
 async def slash_dave(ctx: discord.ApplicationContext):
@@ -286,9 +259,6 @@ async def slash_dave(ctx: discord.ApplicationContext):
     await ctx.respond("\n".join(lines), ephemeral=True)
 
 
-# ── Fault injection ───────────────────────────────────────────────────────────
-
-
 class FaultInjectingSession:
     """Wraps a live DaveSession to inject a single configurable fault at runtime.
 
@@ -301,7 +271,7 @@ class FaultInjectingSession:
     real_session:
         The real DaveSession to wrap.
     fault_type:
-        Which fault to inject (commit_error, welcome_error, decrypt_fail).
+        Which fault to inject (commit_error).
     one_shot:
         If True, the fault fires exactly once and then self-removes (vc.dave_session
         is restored to the real session automatically).  Use this to simulate a
@@ -337,17 +307,7 @@ class FaultInjectingSession:
         return self._real.process_commit(commit)
 
     def process_welcome(self, welcome: bytes) -> None:
-        if self._fault_type == "welcome_error" and not self._fired:
-            self._fired = True
-            self._maybe_self_remove()
-            _fault_log.warning("FAULT FIRED: welcome_error — raising ValueError in process_welcome")
-            raise ValueError("Injected fault: process_welcome failure")
         return self._real.process_welcome(welcome)
-
-    def decrypt_opus(self, user_id: int, data: bytes):
-        if self._fault_type == "decrypt_fail":
-            return None  # silent drop — use /stats to observe effect
-        return self._real.decrypt_opus(user_id, data)
 
 
 fault_group = discord.SlashCommandGroup("fault", "Runtime fault injection for DAVE testing")
@@ -360,8 +320,6 @@ async def fault_set(
             description="Fault to inject",
             choices=[
                 discord.OptionChoice(name="commit_error", value="commit_error"),
-                discord.OptionChoice(name="welcome_error", value="welcome_error"),
-                discord.OptionChoice(name="decrypt_fail", value="decrypt_fail"),
                 discord.OptionChoice(name="ip_timeout", value="ip_timeout"),
                 discord.OptionChoice(name="ws_reconnect", value="ws_reconnect"),
             ],
@@ -371,18 +329,22 @@ async def fault_set(
             description="Fire exactly once then self-clear (realistic transient failure). Default: persistent.",
         ),
 ):
+    """Inject a runtime fault into the active voice connection.
+
+    ws_reconnect: closes the voice WS with code 4015. Triggers RESUME; falls back to
+    full reconnect + DAVE re-handshake if RESUME fails. One-shot, no /fault clear needed.
+
+    ip_timeout: patches discover_ip to always raise TimeoutError, then closes the WS.
+    Every reconnect attempt fails until /fault clear restores the original method.
+
+    commit_error: wraps dave_session so process_commit raises ValueError on the next op 29.
+    Trigger by having a user leave and rejoin to force a new epoch. Expects op 31 sent,
+    session reset, and Discord restarting the DAVE handshake.
+    """
     vc = ctx.voice_client
     if vc is None:
         return await ctx.respond("Not connected to a voice channel.", ephemeral=True)
 
-    # ── ws_reconnect ──────────────────────────────────────────────────────────
-    # HOW TO EXECUTE: /fault set ws_reconnect  (while connected to voice)
-    # Closes the voice WebSocket with code 4015 (voice server crashed).
-    # poll_voice_ws catches ConnectionClosed(4015) and first attempts a RESUME.
-    # If the resume succeeds you'll see "Voice RESUME succeeded" and audio
-    # continues.  If it fails, the bot falls back to a full reconnect with
-    # exponential backoff, re-running the full DAVE handshake from scratch.
-    # No /fault clear needed — this is a one-shot action.
     if fault_type == "ws_reconnect":
         print("[dave-test] FAULT: ws_reconnect — closing voice WS with code 4015")
         await vc.ws.close(4015)
@@ -393,18 +355,6 @@ async def fault_set(
             ephemeral=True,
         )
 
-    # ── ip_timeout ────────────────────────────────────────────────────────────
-    # HOW TO EXECUTE: /fault set ip_timeout  (while connected to voice)
-    # Patches DiscordVoiceWebSocket.discover_ip at the class level to raise
-    # asyncio.TimeoutError instantly, then closes the WS to kick off a reconnect.
-    # Because the patch is class-level, every subsequent reconnect attempt will
-    # also fail — the bot will exhaust its retries and disconnect entirely.
-    # Run /fault clear to restore discover_ip so the next reconnect can succeed.
-    # WHAT TO LOOK FOR:
-    #   "No discovery reply, retrying (1/2)..."
-    #   "UDP discovery timed out after 2 attempts."
-    #   "Failed to connect to voice... Retrying..."  (up to 5 times)
-    #   Bot eventually disconnects from voice.
     if fault_type == "ip_timeout":
         from discord.gateway import DiscordVoiceWebSocket
         global _original_discover_ip
@@ -425,18 +375,13 @@ async def fault_set(
             ephemeral=True,
         )
 
-    # ── DAVE-level faults: commit_error / welcome_error / decrypt_fail ────────
-    # These wrap vc.dave_session with a FaultInjectingSession and stay active
-    # until /fault clear is called.
-
     if vc.dave_session is None:
         return await ctx.respond(
             "No DAVE session active — channel may not be E2EE or davey is not installed.",
             ephemeral=True,
         )
 
-    # Always wrap the real session, not an existing wrapper.
-    real_session = (
+    real_session = (  # always wrap the real session, not an existing wrapper
         vc.dave_session._real
         if isinstance(vc.dave_session, FaultInjectingSession)
         else vc.dave_session
@@ -445,51 +390,11 @@ async def fault_set(
     _fault_sessions[ctx.guild_id] = vc.dave_session
     print(f"[dave-test] FAULT: {fault_type} installed (epoch={real_session.epoch}, ready={real_session.ready}, one_shot={one_shot})")
 
-    if fault_type == "commit_error":
-        # HOW TO EXECUTE: /fault set commit_error  (while connected to an E2EE channel)
-        # process_commit raises ValueError on the next op 29 (MLS_ANNOUNCE_COMMIT_TRANSITION).
-        # TRIGGER: have a user leave and rejoin the voice channel — Discord sends a new
-        # DAVE_PREPARE_EPOCH which eventually produces an op 29 commit.
-        # WHAT TO LOOK FOR:
-        #   "DAVE: process_commit failed (transition_id=N): Injected fault: process_commit failure"
-        #   "DAVE: MLS_INVALID_COMMIT_WELCOME sent for transition_id=N, session reset"
-        #   Discord sends a fresh DAVE_PREPARE_EPOCH → full MLS handshake restarts.
-        # Audio is dropped during the reset window; decryption resumes once the new
-        # epoch is established.  Active until /fault clear.
-        msg = (
-            "commit_error installed on dave_session.\n"
-            "Trigger: have a user leave and rejoin the channel to force a new epoch.\n"
-            "Expected: op 31 sent, session reset, Discord restarts DAVE handshake."
-        )
-    elif fault_type == "welcome_error":
-        # HOW TO EXECUTE: /fault set welcome_error  (while connected to an E2EE channel)
-        # process_welcome raises ValueError on the next op 30 (MLS_WELCOME).
-        # TRIGGER: disconnect and reconnect the bot (/record stop then /record start) so
-        # Discord sends a welcome (op 30) to the bot as the newly-joining member.
-        # WHAT TO LOOK FOR:
-        #   "DAVE: process_welcome failed (transition_id=N): Injected fault: process_welcome failure"
-        #   "DAVE: MLS_INVALID_COMMIT_WELCOME sent for transition_id=N, session reset"
-        #   Discord sends a fresh DAVE_PREPARE_EPOCH → full MLS handshake restarts.
-        # Active until /fault clear.
-        msg = (
-            "welcome_error installed on dave_session.\n"
-            "Trigger: disconnect and reconnect the bot to force a welcome (op 30).\n"
-            "Expected: op 31 sent, session reset, Discord restarts DAVE handshake."
-        )
-    else:  # decrypt_fail
-        # HOW TO EXECUTE: /fault set decrypt_fail  (while recording in an E2EE channel)
-        # decrypt_opus always returns None — every encrypted packet is silently dropped.
-        # No error logs appear (drops are intentionally silent).
-        # TRIGGER: just speak in the channel after running this command.
-        # WHAT TO LOOK FOR:
-        #   /stats showing decrypt_fail climbing and decrypt_ok: 0, decrypt_rate: 0.0.
-        #   The recorded WAV will be silence (or empty if no audio preceded the fault).
-        # Active until /fault clear.
-        msg = (
-            "decrypt_fail installed — all decrypt calls return None.\n"
-            "Speak in the channel, then /stats to confirm decrypt_fail is climbing.\n"
-            "Expected: decrypt_ok: 0, decrypt_rate: 0.0. WAV output will be silence."
-        )
+    msg = (
+        "commit_error installed on dave_session.\n"
+        "Trigger: have a user leave and rejoin the channel to force a new epoch.\n"
+        "Expected: op 31 sent, session reset, Discord restarts DAVE handshake."
+    )
 
     await ctx.respond(msg, ephemeral=True)
 
@@ -523,8 +428,6 @@ async def fault_clear(ctx: discord.ApplicationContext):
 
 
 bot.add_application_command(fault_group)
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if TOKEN == "PASTE_TOKEN_HERE":
