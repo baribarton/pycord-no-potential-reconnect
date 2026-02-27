@@ -12,7 +12,6 @@ DAVE E2EE audio verification bot
 Fault types
 -----------
     commit_error    process_commit raises ValueError on the next op 29.
-    ip_timeout      discover_ip raises TimeoutError; WS is closed to trigger reconnect.
     ws_reconnect    Close the voice WS with code 4015 (simulates a server crash/resume).
 
 Setup
@@ -109,7 +108,6 @@ bot = discord.Bot(intents=intents)
 
 _recording: dict[int, bool] = {}  # guild_id → True while recording
 _fault_sessions: dict[int, "FaultInjectingSession"] = {}  # guild_id → active wrapper
-_original_discover_ip = None  # saved discover_ip; None when ip_timeout is not active
 
 
 @bot.event
@@ -320,7 +318,6 @@ async def fault_set(
             description="Fault to inject",
             choices=[
                 discord.OptionChoice(name="commit_error", value="commit_error"),
-                discord.OptionChoice(name="ip_timeout", value="ip_timeout"),
                 discord.OptionChoice(name="ws_reconnect", value="ws_reconnect"),
             ],
         ),
@@ -333,9 +330,6 @@ async def fault_set(
 
     ws_reconnect: closes the voice WS with code 4015. Triggers RESUME; falls back to
     full reconnect + DAVE re-handshake if RESUME fails. One-shot, no /fault clear needed.
-
-    ip_timeout: patches discover_ip to always raise TimeoutError, then closes the WS.
-    Every reconnect attempt fails until /fault clear restores the original method.
 
     commit_error: wraps dave_session so process_commit raises ValueError on the next op 29.
     Trigger by having a user leave and rejoin to force a new epoch. Expects op 31 sent,
@@ -352,26 +346,6 @@ async def fault_set(
             "Voice WS closed with code 4015 (server crash simulation).\n"
             "Expected: RESUME attempt → full reconnect + DAVE re-handshake if resume fails.\n"
             "Watch for: `Voice RESUME succeeded` or backoff reconnect logs.",
-            ephemeral=True,
-        )
-
-    if fault_type == "ip_timeout":
-        from discord.gateway import DiscordVoiceWebSocket
-        global _original_discover_ip
-        if _original_discover_ip is None:
-            _original_discover_ip = DiscordVoiceWebSocket.discover_ip
-
-            async def _patched_discover_ip(self, state, max_attempts=2, base_timeout=3.0):
-                _fault_log.warning("FAULT FIRED: ip_timeout — raising TimeoutError in discover_ip")
-                raise asyncio.TimeoutError()
-
-            DiscordVoiceWebSocket.discover_ip = _patched_discover_ip
-
-        print("[dave-test] FAULT: ip_timeout — discover_ip patched, closing voice WS with code 4015")
-        await vc.ws.close(4015)
-        return await ctx.respond(
-            "discover_ip patched to timeout. WS closed → all reconnect attempts will fail.\n"
-            "Run `/fault clear` to restore discover_ip and allow reconnection.",
             ephemeral=True,
         )
 
@@ -404,15 +378,6 @@ async def fault_clear(ctx: discord.ApplicationContext):
     vc = ctx.voice_client
     cleared = []
 
-    # Restore discover_ip if ip_timeout patch is active.
-    global _original_discover_ip
-    if _original_discover_ip is not None:
-        from discord.gateway import DiscordVoiceWebSocket
-        DiscordVoiceWebSocket.discover_ip = _original_discover_ip
-        _original_discover_ip = None
-        cleared.append("ip_timeout (discover_ip restored)")
-
-    # Remove the session wrapper if one is installed.
     if vc is not None and isinstance(vc.dave_session, FaultInjectingSession):
         fault_type = vc.dave_session._fault_type
         vc.dave_session = vc.dave_session._real
