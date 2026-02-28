@@ -776,33 +776,33 @@ class DiscordVoiceWebSocket:
     RESUMED
         Sent only. Tells you that your RESUME request has succeeded.
     CLIENTS_CONNECT
-        Receive only. One or more users connected to the media session (DAVE).
+        Receive only. One or more users joined the voice channel (used to track who is in the encrypted group).
     CLIENT_CONNECT
         Indicates a user has connected to voice.
     CLIENT_DISCONNECT
         Receive only.  Indicates a user has disconnected from voice.
     DAVE_PREPARE_TRANSITION
-        Receive only. Upcoming DAVE protocol transition announcement.
+        Receive only. Server announces an upcoming encryption protocol change.
     DAVE_EXECUTE_TRANSITION
-        Receive only. Execute a previously announced DAVE protocol transition.
+        Receive only. Apply the encryption protocol change that was announced earlier.
     DAVE_TRANSITION_READY
-        Send only. Client is ready for the announced DAVE transition.
+        Send only. Acknowledge to the server that we are ready for the encryption change.
     DAVE_PREPARE_EPOCH
-        Receive only. Announces the upcoming MLS epoch/protocol version change.
+        Receive only. Server announces the encryption key group is about to rotate or be rebuilt.
     MLS_EXTERNAL_SENDER
-        Receive only (binary). Voice-gateway external sender credentials.
+        Receive only (binary). Server's signing authority credentials — used to validate key-exchange messages.
     MLS_KEY_PACKAGE
-        Send only (binary). Client MLS key package.
+        Send only (binary). This client's public cryptographic credentials for joining the encrypted group.
     MLS_PROPOSALS
-        Receive only (binary). MLS proposals to append or revoke.
+        Receive only (binary). Server-requested membership changes (add or remove users from the encrypted group).
     MLS_COMMIT_WELCOME
-        Send only (binary). Client MLS commit + optional welcome.
+        Send only (binary). Our acceptance of the membership changes, plus an invite for any newly added users.
     MLS_ANNOUNCE_COMMIT_TRANSITION
-        Receive only (binary). Broadcast MLS commit with transition ID.
+        Receive only (binary). Server broadcasts a key-rotation commit with a transition ID.
     MLS_WELCOME
-        Receive only (binary). MLS welcome for this client.
+        Receive only (binary). Personalised invite carrying the current group encryption key for this client.
     MLS_INVALID_COMMIT_WELCOME
-        Send only (JSON). Flag an invalid commit or welcome to the gateway.
+        Send only (JSON). Tell the server that the commit or welcome we received was invalid.
 
     Binary frame layout (server→client): ``[uint16 BE seq_ack][uint8 op][payload]``.
     Client→server binary: ``[uint8 op][payload]``.
@@ -843,7 +843,7 @@ class DiscordVoiceWebSocket:
         self.secret_key = None
         self.ssrc_map = {}
         self.seq_ack: int = -1
-        # User IDs for validating MLS add proposals.
+        # Discord user IDs currently in the encrypted group — used to validate membership changes.
         self.dave_known_user_ids: set[int] = set()
         self.last_dave_op: int = -1
         if hook:
@@ -953,10 +953,10 @@ class DiscordVoiceWebSocket:
         await self.send_as_json(payload)
 
     async def send_transition_ready(self, transition_id: int) -> None:
-        """Notify the voice gateway that we are ready for a DAVE transition.
+        """Tell the server we are ready for the announced encryption change.
 
         Sent in response to DAVE_PREPARE_TRANSITION (op 21) or after
-        successfully processing an MLS commit (op 29) or welcome (op 30).
+        successfully applying a key-rotation commit (op 29) or welcome (op 30).
         """
         payload = {
             "op": self.DAVE_TRANSITION_READY,
@@ -999,7 +999,7 @@ class DiscordVoiceWebSocket:
         # ── DAVE JSON opcodes ─────────────────────────────────────────────
 
         elif op == self.CLIENTS_CONNECT:
-            # Track user IDs joining the MLS group.
+            # Track which Discord users are in the encrypted group.
             user_ids = data.get("user_ids", [])
             for user_id in user_ids:
                 self.dave_known_user_ids.add(int(user_id))
@@ -1025,7 +1025,7 @@ class DiscordVoiceWebSocket:
             voice_client = self._connection
             voice_client.dave_pending_transitions[transition_id] = protocol_version
             if protocol_version == 0 and voice_client.dave_session:
-                # Downgrade to non-DAVE: accept un-encrypted audio during transition.
+                # Downgrading to non-E2EE: temporarily allow unencrypted audio while the change completes.
                 voice_client.dave_session.set_passthrough_mode(True, 120)
             if transition_id == 0:
                 # Initialisation transition: execute immediately without waiting.
@@ -1040,7 +1040,7 @@ class DiscordVoiceWebSocket:
             await self._connection._execute_transition(transition_id)
 
         elif op == self.DAVE_PREPARE_EPOCH:
-            # epoch=1 means the MLS group is being (re-)created.
+            # epoch=1 means the encrypted group is being built (or rebuilt) from scratch.
             epoch = data["epoch"]
             protocol_version = data["protocol_version"]
             self.last_dave_op = op
@@ -1079,7 +1079,7 @@ class DiscordVoiceWebSocket:
                 _log.error("DAVE: set_external_sender failed: %s", exc)
 
         elif binary_opcode == self.MLS_PROPOSALS:
-            # op_type byte: 0 = append, 1 = revoke.
+            # op_type byte: 0 = add user, 1 = remove user.
             if len(msg) < 4:
                 _log.warning("DAVE: MLS_PROPOSALS too short (%d bytes)", len(msg))
                 return
@@ -1130,11 +1130,11 @@ class DiscordVoiceWebSocket:
                 return
             if voice_client.dave_session.ready:
                 await voice_client._drain_dave_queue()
-            # Accept un-encrypted frames during the epoch-transition window.
+            # Temporarily allow unencrypted audio while the new encryption key is being applied.
             voice_client.dave_session.set_passthrough_mode(True, 10)
-            # Pre-register so op 22 can match (op 21 not sent to new members).
+            # Register the transition so EXECUTE_TRANSITION (op 22) can match it — new members don't receive PREPARE_TRANSITION (op 21).
             voice_client.dave_pending_transitions.setdefault(transition_id, voice_client.dave_protocol_version)
-            # Acknowledge the new epoch.
+            # Acknowledge the key rotation to the server.
             await self.send_transition_ready(transition_id)
 
         elif binary_opcode == self.MLS_WELCOME:
@@ -1163,24 +1163,24 @@ class DiscordVoiceWebSocket:
                 return
             if voice_client.dave_session.ready:
                 await voice_client._drain_dave_queue()
-            # Accept un-encrypted frames during the epoch-transition window.
+            # Temporarily allow unencrypted audio while the new encryption key is being applied.
             voice_client.dave_session.set_passthrough_mode(True, 10)
-            # Pre-register so op 22 can match (op 21 not sent to new members).
+            # Register the transition so EXECUTE_TRANSITION (op 22) can match it — new members don't receive PREPARE_TRANSITION (op 21).
             voice_client.dave_pending_transitions.setdefault(transition_id, voice_client.dave_protocol_version)
-            # Acknowledge the new epoch.
+            # Acknowledge the key rotation to the server.
             await self.send_transition_ready(transition_id)
 
         else:
             _log.debug("DAVE: unknown binary opcode %d (%d bytes), ignoring", binary_opcode, len(msg))
 
     async def _recover_from_invalid_commit(self, transition_id: int) -> None:
-        """Notify the server of a bad commit/welcome, reset local DAVE state, and reconnect.
+        """Tell the server a key-exchange message was invalid, reset local state, and reconnect.
 
-        Sends MLS_INVALID_COMMIT_WELCOME (op 31, JSON C→S), resets the session,
-        then closes the voice WebSocket (code 4000) to force a full reconnect.
-        Closing is necessary because Discord does not reliably send a new
-        DAVE_PREPARE_EPOCH after receiving op 31 — without a reconnect the bot
-        would sit indefinitely with epoch=None and all decryption failing.
+        Sends MLS_INVALID_COMMIT_WELCOME (op 31) to report the bad message, resets the
+        encryption session, then closes the voice WebSocket (code 4000) to force a full
+        reconnect. The reconnect is necessary because Discord does not reliably send a new
+        DAVE_PREPARE_EPOCH after op 31 — without it the session would be stuck with no
+        encryption keys and all audio failing to decrypt.
         """
         await self.send_as_json(
             {"op": self.MLS_INVALID_COMMIT_WELCOME, "d": {"transition_id": transition_id}}

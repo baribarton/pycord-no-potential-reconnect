@@ -38,10 +38,10 @@ except ImportError:  # pragma: no cover
 # Exposed here so tests and voice_client.py share a single source of truth.
 # ---------------------------------------------------------------------------
 
-#: Maximum un-drained packets held per SSRC while waiting for ssrc→user_id.
+#: Maximum buffered packets per audio stream while we wait to learn which Discord user it belongs to.
 DAVE_QUEUE_MAX_PER_SSRC: int = 32
 
-#: Maximum total packets across all SSRCs in the raw queue.
+#: Maximum total buffered packets across all audio streams.
 DAVE_QUEUE_MAX_TOTAL: int = 256
 
 
@@ -85,12 +85,12 @@ class DaveSession:
 
     @property
     def ready(self) -> bool:
-        """``True`` after MLS welcome or own commit is processed (session active)."""
+        """``True`` once the encrypted group is established and audio can be decrypted."""
         return self._davey_session.ready
 
     @property
     def epoch(self) -> Optional[int]:
-        """Current MLS epoch, or ``None`` before the first group is established."""
+        """Current key generation number — increments each time group membership changes. ``None`` before the first group is formed."""
         return self._davey_session.epoch
 
     @property
@@ -101,23 +101,24 @@ class DaveSession:
     # ── MLS handshake ────────────────────────────────────────────────────────
 
     def set_external_sender(self, data: bytes) -> None:
-        """Process the voice-gateway external sender package (op 25 payload).
+        """Register the server's signing authority used to validate key-exchange messages (op 25).
 
-        ``data`` is ``msg[3:]`` — everything after the 2-byte seq + 1-byte op.
+        ``data`` is ``msg[3:]`` — the payload after the 3-byte binary frame header.
 
         Raises
         ------
         ValueError
-            If the external sender data is malformed.
+            If the data is malformed.
         """
         self._davey_session.set_external_sender(data)
         _log.debug("DAVE: external sender set (%d bytes)", len(data))
 
     def get_key_package(self) -> bytes:
-        """Generate and return a fresh serialised MLS key package.
+        """Generate and return a fresh key package to send to the server.
 
-        Each call produces a new key package (unique nonce per MLS spec).
-        Do not call more than once per handshake phase.
+        A key package bundles this client's public cryptographic credentials.
+        The server shares it with other group members so they can include us in
+        encryption. Each call produces a different package — only call once per handshake.
         """
         key_package = self._davey_session.get_serialized_key_package()
         _log.debug("DAVE: key package generated (%d bytes)", len(key_package))
@@ -128,24 +129,28 @@ class DaveSession:
         operation_type: int,
         data: bytes,
     ) -> Optional[tuple[bytes, Optional[bytes]]]:
-        """Process an MLS proposals message (op 27 payload after op-type byte).
+        """Process a membership-change request from the server (op 27).
+
+        The server sends these to add or remove users from the encrypted group.
+        If accepted, this returns a commit (and optionally a welcome for any newly
+        added users) to send back to the server.
 
         Parameters
         ----------
         operation_type:
-            ``0`` = append, ``1`` = revoke
-            (from ``msg[3]`` in op-27 binary frame).
+            ``0`` = add user, ``1`` = remove user
+            (from ``msg[3]`` in the op-27 binary frame).
         data:
-            Raw proposal bytes (``msg[4:]`` in op-27 binary frame).
+            Raw proposal bytes (``msg[4:]`` in the op-27 binary frame).
 
         Returns
         -------
-        ``(commit, welcome_or_None)`` if a commit was produced, else ``None``.
+        ``(commit, welcome_or_None)`` if the change was accepted, else ``None``.
 
         Raises
         ------
         ValueError
-            If proposals cannot be processed (e.g. no group yet).
+            If the change cannot be applied (e.g. no group established yet).
         """
         proposals_operation = (
             _davey.ProposalsOperationType.append
@@ -163,7 +168,10 @@ class DaveSession:
         return None
 
     def process_commit(self, commit: bytes) -> None:
-        """Process a broadcast MLS commit (op 29 payload at ``msg[5:]``).
+        """Apply a key-rotation commit broadcast by the server (op 29).
+
+        A commit finalises pending membership changes and rotates the group's
+        encryption key. Once applied, ``epoch`` increments and ``ready`` is ``True``.
 
         Raises
         ------
@@ -176,7 +184,10 @@ class DaveSession:
         )
 
     def process_welcome(self, welcome: bytes) -> None:
-        """Process an MLS welcome (op 30 payload at ``msg[5:]``).
+        """Apply a welcome message that adds this client to the encrypted group (op 30).
+
+        A welcome carries the current group encryption key, encrypted specifically for
+        this client. Once applied, ``epoch`` is set and ``ready`` is ``True``.
 
         Raises
         ------
@@ -196,23 +207,22 @@ class DaveSession:
         Parameters
         ----------
         user_id:
-            Discord snowflake integer — **not** the RTP SSRC.
-            The caller must resolve ``ssrc → user_id`` before calling this.
+            Discord user ID — not the RTP stream ID (SSRC). The caller must
+            look up ``ssrc_map[ssrc]["user_id"]`` before calling this.
         data:
-            Transport-decrypted bytes (output of the nacl layer).
+            Audio bytes after transport decryption (output of the NaCl layer).
 
         Returns
         -------
-        Decrypted opus bytes on success, ``None`` on failure (packet should
-        be dropped silently).
+        Decrypted opus bytes on success, ``None`` if the packet should be dropped.
 
         Notes
         -----
-        Possible ``ValueError`` reasons from davey:
+        Reasons a packet may be dropped:
 
-        * ``NoDecryptorForUser`` — session not yet active for this user.
-        * ``DecryptionFailed`` — wrong key / corrupted frame.
-        * ``DuplicateNonce`` — replay protection triggered.
+        * ``NoDecryptorForUser`` — encryption key not yet established for this user.
+        * ``DecryptionFailed`` — wrong key or corrupted audio frame.
+        * ``DuplicateNonce`` — packet counter already seen; dropped by anti-replay check.
         """
         with self._lock:
             try:
@@ -223,12 +233,13 @@ class DaveSession:
                 self._decrypt_fail[user_id] = self._decrypt_fail.get(user_id, 0) + 1
                 error_message = str(exc)
                 if "NoDecryptorForUser" in error_message:
-                    # Normal during MLS handshake — new member not yet welcomed.
+                    # Expected during key exchange — this user's encryption key isn't set up yet.
                     _log.debug("DAVE decrypt: no decryptor yet uid=%d (handshake pending)", user_id)
                 elif "DuplicateNonce" in error_message:
-                    # Replay protection — benign, discard silently.
+                    # Replay protection: this packet counter was already seen, so drop it.
                     _log.debug("DAVE decrypt: duplicate nonce uid=%d", user_id)
                 elif "NoValidCryptorFound" in error_message:
+                    # Key rotation in progress — old key expired, new one not yet applied.
                     _log.debug("DAVE decrypt: no valid cryptor uid=%d (epoch transition)", user_id)
                 else:
                     # DecryptionFailed or unknown — worth knowing about.
@@ -241,26 +252,26 @@ class DaveSession:
                 return None
 
     def can_passthrough(self, user_id: int) -> bool:
-        """Whether unencrypted frames are allowed through for this user.
+        """Whether unencrypted audio frames should be accepted for this user.
 
-        Returns ``False`` before a decryptor is registered (i.e. before
-        welcome completes).  ``True`` only if passthrough mode is active
-        *and* a decryptor exists.
+        ``True`` only during a passthrough window (key rotation or protocol downgrade)
+        and only once this user's encryption key has been registered. ``False`` otherwise.
         """
         return self._davey_session.can_passthrough(user_id)
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def set_passthrough_mode(self, enabled: bool, expiry_secs: int = 10) -> None:
-        """Enable or disable passthrough mode on all decryptors.
+        """Temporarily allow unencrypted audio through during key rotation or protocol changes.
 
+        Used so audio isn't dropped while new encryption keys are being negotiated.
         ``expiry_secs`` is ignored when ``enabled=False``.
         """
         self._davey_session.set_passthrough_mode(enabled, expiry_secs)
         _log.debug("DAVE: passthrough_mode=%s expiry=%ds", enabled, expiry_secs)
 
     def reset(self) -> None:
-        """Full reset — clears MLS group state and all decryptors."""
+        """Full reset — clears all encryption state and per-user keys."""
         self._davey_session.reset()
         self._decrypt_ok.clear()
         self._decrypt_fail.clear()
@@ -272,10 +283,11 @@ class DaveSession:
         user_id: int,
         channel_id: int,
     ) -> None:
-        """Re-initialise in place (equivalent to reset + new session params).
+        """Re-initialise in place with new session parameters (equivalent to reset + reconfigure).
 
-        Called on ``DAVE_PREPARE_EPOCH(epoch=1)`` to handle group recreation.
-        After this call: ``epoch=None``, ``ready=False``.
+        Called when the server signals the encrypted group is being rebuilt from scratch
+        (``DAVE_PREPARE_EPOCH`` with ``epoch=1``).
+        After this call the session is back to its initial state: ``epoch=None``, ``ready=False``.
         """
         self._davey_session.reinit(protocol_version, user_id, channel_id)
         self._decrypt_ok.clear()

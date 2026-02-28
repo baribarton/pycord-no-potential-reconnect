@@ -278,7 +278,7 @@ class VoiceClient(VoiceProtocol):
         self.dave_protocol_version: int = 0
         # Maps transition_id → protocol_version for pending transitions.
         self.dave_pending_transitions: dict[int, int] = {}
-        # Packets queued while ssrc→user_id is unresolved; drained by unpack_audio.
+        # Packets buffered while we wait to learn which Discord user owns each audio stream.
         self._dave_raw_queue: dict[int, list] = {}
         self._poll_backoff: ExponentialBackoff = ExponentialBackoff()
 
@@ -617,28 +617,24 @@ class VoiceClient(VoiceProtocol):
             )
 
     def _reset_reconnect_backoff(self) -> None:
-        """Reset the poll_voice_ws backoff after a DAVE-triggered reconnect.
+        """Reset the reconnect delay after a DAVE encryption failure (not a network failure).
 
-        DAVE protocol failures (invalid commit/welcome) are not network failures.
-        The server was reachable and the WS handshake succeeded; only the MLS
-        layer failed.  Resetting here keeps DAVE recovery retries on the order
-        of seconds rather than accumulating into the same 100-second delays used
-        for genuine network outages.
+        When a key-exchange message is invalid, the server was reachable — only the
+        encryption layer failed. Resetting the backoff here keeps retries fast (seconds)
+        instead of escalating to the same long delays used for genuine network outages.
         """
         self._poll_backoff = ExponentialBackoff()
         _log.debug("DAVE: reconnect backoff reset")
 
     async def reinit_dave_session(self, ws=None) -> None:
-        """Create or reinitialise the DAVE MLS session and send a fresh key package.
+        """Create or reinitialise the DAVE encryption session and send a fresh key package.
 
-        Called by the gateway on:
-        * SESSION_DESCRIPTION with ``dave_protocol_version > 0``
-        * DAVE_PREPARE_EPOCH with ``epoch == 1``
+        Called by the gateway when E2EE is active:
+        * SESSION_DESCRIPTION with ``dave_protocol_version > 0`` (initial join)
+        * DAVE_PREPARE_EPOCH with ``epoch == 1`` (encrypted group being rebuilt)
 
-        ``ws`` is the active :class:`DiscordVoiceWebSocket`.  It must be
-        supplied during the initial handshake because ``self.ws`` has not been
-        assigned yet at that point.  After the handshake completes it falls
-        back to ``self.ws``.
+        ``ws`` must be passed during the initial handshake because ``self.ws`` is not
+        assigned yet at that point. After the handshake it falls back to ``self.ws``.
         """
         if not has_dave:
             raise RuntimeError(
@@ -654,7 +650,7 @@ class VoiceClient(VoiceProtocol):
         else:
             self.dave_session.reinit(self.dave_protocol_version, user_id, channel_id)
 
-        # Op 26 MLS_KEY_PACKAGE is C→S binary: [op][key_package_bytes]
+        # Send our public credentials to the server so it can add us to the encrypted group (op 26).
         key_package = self.dave_session.get_key_package()
         target_ws = ws if ws is not None else self.ws
         await target_ws.send_binary(target_ws.MLS_KEY_PACKAGE, key_package)
@@ -667,12 +663,12 @@ class VoiceClient(VoiceProtocol):
         )
 
     async def _execute_transition(self, transition_id: int) -> None:
-        """Execute a previously announced DAVE protocol transition.
+        """Apply an announced encryption protocol change.
 
-        Called by the gateway on DAVE_PREPARE_TRANSITION (transition_id=0)
-        or DAVE_EXECUTE_TRANSITION.  If ``transition_id`` is not in
-        ``dave_pending_transitions`` the transition was already applied
-        (post-RESUME replay or new-member path) and the call is a no-op.
+        Called on DAVE_PREPARE_TRANSITION (transition_id=0, applied immediately)
+        or DAVE_EXECUTE_TRANSITION (deferred). If the transition ID is not pending
+        it was already applied (e.g. after a resume or as a new member) and this
+        call is a no-op.
         """
         protocol_version = self.dave_pending_transitions.pop(transition_id, None)
         if protocol_version is None:
@@ -689,7 +685,7 @@ class VoiceClient(VoiceProtocol):
             protocol_version,
         )
         if protocol_version == 0:
-            # Transition to non-DAVE: tear down the MLS session.
+            # Downgrading to non-E2EE: tear down the encryption session.
             if self.dave_session is not None:
                 self.dave_session.reset()
                 self.dave_session = None
@@ -697,7 +693,7 @@ class VoiceClient(VoiceProtocol):
             self._dave_raw_queue.clear()
             _log.info("DAVE: transitioned out of E2EE (protocol_version=0)")
         else:
-            # Session reinit already happened at PREPARE_EPOCH; commit/welcome completes it.
+            # Encryption session was already reinitialised at PREPARE_EPOCH; this activates the new version.
             self.dave_protocol_version = protocol_version
             _log.info(
                 "DAVE: executing transition to protocol_version=%d (session.ready=%s)",
@@ -706,12 +702,12 @@ class VoiceClient(VoiceProtocol):
             )
 
     async def _drain_dave_queue(self) -> None:
-        """Drain queued DAVE packets for SSRCs whose user_id mapping is now known.
+        """Decrypt and forward buffered audio packets now that encryption keys are ready.
 
-        Called after an MLS welcome or commit makes the session ready.
-        Packets whose SSRC is not yet mapped to a user_id are left in the
-        queue and drained lazily in ``unpack_audio`` when the next packet
-        arrives for that SSRC.
+        Audio packets that arrived before we knew which Discord user sent them are
+        buffered. This is called after a key-rotation commit or welcome establishes
+        the encryption keys. Packets whose audio stream is still unmapped stay buffered
+        and are processed lazily in ``unpack_audio`` when the next packet arrives.
         """
         if not self._dave_raw_queue or self.dave_session is None or not self.decoder:
             return
@@ -974,21 +970,21 @@ class VoiceClient(VoiceProtocol):
             user_id = self.ws.ssrc_map.get(ssrc, {}).get("user_id")
 
             if user_id is None:
-                # ssrc→user_id not yet known: hold the transport-decrypted frame.
+                # We don't yet know which Discord user owns this audio stream — buffer the frame.
                 total = sum(len(v) for v in self._dave_raw_queue.values())
                 if total >= DAVE_QUEUE_MAX_TOTAL:
-                    # Global cap: evict oldest packet from the largest backlog.
+                    # Buffer full: drop the oldest packet from the stream with the most backlog.
                     evict = max(self._dave_raw_queue, key=lambda s: len(self._dave_raw_queue[s]))
                     self._dave_raw_queue[evict].pop(0)
                     if not self._dave_raw_queue[evict]:
                         del self._dave_raw_queue[evict]
                 per = self._dave_raw_queue.setdefault(ssrc, [])
                 if len(per) >= DAVE_QUEUE_MAX_PER_SSRC:
-                    per.pop(0)  # per-ssrc cap
+                    per.pop(0)  # Per-stream cap: drop oldest if this stream's buffer is also full.
                 per.append(data)
                 return
 
-            # ssrc→user_id now known: drain any frames queued for this ssrc first.
+            # We now know the user — decrypt any buffered frames for this stream first.
             if ssrc in self._dave_raw_queue:
                 queued = self._dave_raw_queue.pop(ssrc)
                 _log.debug(
@@ -1002,7 +998,7 @@ class VoiceClient(VoiceProtocol):
                     if dave_decrypted is None:
                         continue
                     if dave_decrypted == transport_decrypted:
-                        # Passthrough: DAVE-framed unencrypted packet, not opus.
+                        # Unencrypted packet in a DAVE wrapper — not real audio, drop it.
                         continue
                     queued_packet.decrypted_data = dave_decrypted
                     if queued_packet.decrypted_data == b"\xf8\xff\xfe":
@@ -1012,9 +1008,9 @@ class VoiceClient(VoiceProtocol):
             transport_decrypted = data.decrypted_data
             dave_decrypted = self.dave_session.decrypt_opus(user_id, transport_decrypted)
             if dave_decrypted is None:
-                return  # drop: wrong key / replay / decryptor not yet active
+                return  # drop: wrong key, replay, or encryption key not yet established
             if dave_decrypted == transport_decrypted:
-                # Passthrough: DAVE-framed unencrypted packet, not opus.  Drop.
+                # Unencrypted packet in a DAVE wrapper — not real audio, drop it.
                 return
             data.decrypted_data = dave_decrypted
         # ──────────────────────────────────────────────────────────────────
