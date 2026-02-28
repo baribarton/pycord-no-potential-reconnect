@@ -23,7 +23,7 @@ class TestFakeDaveSessionBasics:
     """FakeDaveSession state machine and bookkeeping."""
 
     def _make(self, **kw):
-        from discord.dave_session import FakeDaveSession
+        from tests.fakes import FakeDaveSession
         return FakeDaveSession(**kw)
 
     def test_default_ready(self):
@@ -334,19 +334,19 @@ class TestFakeDaveSessionAsPipelineStandin:
     """FakeDaveSession passes through opus bytes unchanged, enabling pipeline tests."""
 
     def test_decrypt_returns_input(self):
-        from discord.dave_session import FakeDaveSession
+        from tests.fakes import FakeDaveSession
         s = FakeDaveSession()
         opus_bytes = bytes(range(20))
         result = s.decrypt_opus(12345678, opus_bytes)
         assert result == opus_bytes
 
     def test_fail_decrypt_returns_none(self):
-        from discord.dave_session import FakeDaveSession
+        from tests.fakes import FakeDaveSession
         s = FakeDaveSession(fail_decrypt=True)
         assert s.decrypt_opus(12345678, b"data") is None
 
     def test_stats_accumulate_across_users(self):
-        from discord.dave_session import FakeDaveSession
+        from tests.fakes import FakeDaveSession
         s = FakeDaveSession()
         s.decrypt_opus(1, b"a")
         s.decrypt_opus(2, b"b")
@@ -356,7 +356,7 @@ class TestFakeDaveSessionAsPipelineStandin:
         assert stats["per_user_ok"] == {1: 2, 2: 1}
 
     def test_fail_stats_accumulate(self):
-        from discord.dave_session import FakeDaveSession
+        from tests.fakes import FakeDaveSession
         s = FakeDaveSession(fail_decrypt=True)
         s.decrypt_opus(1, b"x")
         s.decrypt_opus(1, b"y")
@@ -365,7 +365,7 @@ class TestFakeDaveSessionAsPipelineStandin:
         assert stats["decrypt_ok"] == 0
 
     def test_mixed_stats_rate(self):
-        from discord.dave_session import FakeDaveSession
+        from tests.fakes import FakeDaveSession
         s = FakeDaveSession(fail_decrypt=False)
         s.decrypt_opus(1, b"ok")
         # Manually inject a fail
