@@ -51,6 +51,12 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
 from . import opus, utils
 from .backoff import ExponentialBackoff
+from .dave_session import (
+    DAVE_QUEUE_MAX_PER_SSRC,
+    DAVE_QUEUE_MAX_TOTAL,
+    DaveSession,
+    has_dave,
+)
 from .errors import ClientException, ConnectionClosed
 from .gateway import *
 from .player import AudioPlayer, AudioSource
@@ -267,6 +273,15 @@ class VoiceClient(VoiceProtocol):
         self.stopping_time = None
         self.temp_queued_data: dict[int, list] = {}
 
+        # None when DAVE is inactive (non-E2EE channel or davey not installed).
+        self.dave_session: DaveSession | None = None
+        self.dave_protocol_version: int = 0
+        # Maps transition_id → protocol_version for pending transitions.
+        self.dave_pending_transitions: dict[int, int] = {}
+        # Packets buffered while we wait to learn which Discord user owns each audio stream.
+        self._dave_raw_queue: dict[int, list] = {}
+        self._poll_backoff: ExponentialBackoff = ExponentialBackoff()
+
     warn_nacl = not has_nacl
     supported_modes: tuple[SupportedModes, ...] = (
         "xsalsa20_poly1305_lite",
@@ -356,6 +371,9 @@ class VoiceClient(VoiceProtocol):
         self._voice_state_complete.clear()
         self._voice_server_complete.clear()
         self._handshaking = True
+        # Stale state from any previous session is invalid in a new one.
+        self.dave_pending_transitions.clear()
+        self._dave_raw_queue.clear()
         _log.info(
             "Starting voice handshake... (connection attempt %d)", self._connections + 1
         )
@@ -415,6 +433,7 @@ class VoiceClient(VoiceProtocol):
 
         if self._runner is MISSING:
             self._runner = self.loop.create_task(self.poll_voice_ws(reconnect))
+            self._runner.add_done_callback(self._on_poll_voice_ws_done)
 
     async def potential_reconnect(self) -> bool:
         # Attempt to stop the player thread from playing early
@@ -462,7 +481,7 @@ class VoiceClient(VoiceProtocol):
         return float("inf") if not ws else ws.average_latency
 
     async def poll_voice_ws(self, reconnect: bool) -> None:
-        backoff = ExponentialBackoff()
+        self._poll_backoff = ExponentialBackoff()
         while True:
             try:
                 await self.ws.poll_event()
@@ -498,23 +517,39 @@ class VoiceClient(VoiceProtocol):
                     if exc.code == 4015:
                         _log.info("Disconnected from voice, trying to resume...")
 
+                        # SPEAKING events aren't replayed on RESUME; preserve the old mappings.
+                        _old_ssrc_map = dict(self.ws.ssrc_map)
+                        _old_seq_ack = self.ws.seq_ack
+
                         try:
-                            await self.ws.resume()
+                            self.ws = await DiscordVoiceWebSocket.from_client(
+                                self, resume=True, seq_ack=_old_seq_ack
+                            )
                         except asyncio.TimeoutError:
                             _log.info(
-                                "Could not resume the voice connection... Disconnection..."
+                                "Could not resume the voice connection... Disconnecting..."
                             )
                             if self._connected.is_set():
                                 await self.disconnect(force=True)
+                        except Exception:
+                            _log.exception(
+                                "Unexpected error during voice RESUME; "
+                                "falling through to full reconnect."
+                            )
                         else:
-                            _log.info("Successfully resumed voice connection")
+                            self.ws.ssrc_map.update(_old_ssrc_map)
+                            _log.info(
+                                "Successfully resumed voice connection "
+                                "(restored %d ssrc_map entries)",
+                                len(_old_ssrc_map),
+                            )
                             continue
 
                 if not reconnect:
                     await self.disconnect()
                     raise
 
-                retry = backoff.delay()
+                retry = self._poll_backoff.delay()
                 _log.exception(
                     "Disconnected from voice... Reconnecting in %.2fs.", retry
                 )
@@ -564,6 +599,145 @@ class VoiceClient(VoiceProtocol):
     def is_connected(self) -> bool:
         """Indicates if the voice client is connected to voice."""
         return self._connected.is_set()
+
+    # ── DAVE E2EE ────────────────────────────────────────────────────────────
+
+    def _on_poll_voice_ws_done(self, task: "asyncio.Task[None]") -> None:
+        """Log any exception that escapes poll_voice_ws to prevent silent crashes.
+
+        asyncio tasks swallow unhandled exceptions until the task object is
+        garbage-collected (or explicitly checked).  This callback fires
+        immediately on task completion so crashes are always visible in the log.
+        """
+        if not task.cancelled() and task.exception() is not None:
+            _log.error(
+                "poll_voice_ws task ended with an unhandled exception; "
+                "voice connection may be lost.",
+                exc_info=task.exception(),
+            )
+
+    def _reset_reconnect_backoff(self) -> None:
+        """Reset the reconnect delay after a DAVE encryption failure (not a network failure).
+
+        When a key-exchange message is invalid, the server was reachable — only the
+        encryption layer failed. Resetting the backoff here keeps retries fast (seconds)
+        instead of escalating to the same long delays used for genuine network outages.
+        """
+        self._poll_backoff = ExponentialBackoff()
+        _log.debug("DAVE: reconnect backoff reset")
+
+    async def reinit_dave_session(self, ws=None) -> None:
+        """Create or reinitialise the DAVE encryption session and send a fresh key package.
+
+        Called by the gateway when E2EE is active:
+        * SESSION_DESCRIPTION with ``dave_protocol_version > 0`` (initial join)
+        * DAVE_PREPARE_EPOCH with ``epoch == 1`` (encrypted group being rebuilt)
+
+        ``ws`` must be passed during the initial handshake because ``self.ws`` is not
+        assigned yet at that point. After the handshake it falls back to ``self.ws``.
+        """
+        if not has_dave:
+            raise RuntimeError(
+                "E2EE voice requires the 'davey' library. "
+                "Install it with: pip install davey"
+            )
+        user_id = self.user.id
+        channel_id = self.channel.id
+        if self.dave_session is None:
+            self.dave_session = DaveSession(
+                self.dave_protocol_version, user_id, channel_id
+            )
+        else:
+            self.dave_session.reinit(self.dave_protocol_version, user_id, channel_id)
+
+        # Send our public credentials to the server so it can add us to the encrypted group (op 26).
+        key_package = self.dave_session.get_key_package()
+        target_ws = ws if ws is not None else self.ws
+        await target_ws.send_binary(target_ws.MLS_KEY_PACKAGE, key_package)
+        _log.debug(
+            "DAVE: reinit_dave_session version=%d uid=%d channel=%d key_package=%d bytes",
+            self.dave_protocol_version,
+            user_id,
+            channel_id,
+            len(key_package),
+        )
+
+    async def _execute_transition(self, transition_id: int) -> None:
+        """Apply an announced encryption protocol change.
+
+        Called on DAVE_PREPARE_TRANSITION (transition_id=0, applied immediately)
+        or DAVE_EXECUTE_TRANSITION (deferred). If the transition ID is not pending
+        it was already applied (e.g. after a resume or as a new member) and this
+        call is a no-op.
+        """
+        protocol_version = self.dave_pending_transitions.pop(transition_id, None)
+        if protocol_version is None:
+            _log.debug(
+                "DAVE: _execute_transition for already-executed or "
+                "unannounced transition_id=%d — skipping",
+                transition_id,
+            )
+            return
+
+        _log.debug(
+            "DAVE: execute_transition id=%d protocol_version=%d",
+            transition_id,
+            protocol_version,
+        )
+        if protocol_version == 0:
+            # Downgrading to non-E2EE: tear down the encryption session.
+            if self.dave_session is not None:
+                self.dave_session.reset()
+                self.dave_session = None
+            self.dave_protocol_version = 0
+            self._dave_raw_queue.clear()
+            _log.info("DAVE: transitioned out of E2EE (protocol_version=0)")
+        else:
+            # Encryption session was already reinitialised at PREPARE_EPOCH; this activates the new version.
+            self.dave_protocol_version = protocol_version
+            _log.info(
+                "DAVE: executing transition to protocol_version=%d (session.ready=%s)",
+                protocol_version,
+                self.dave_session.ready if self.dave_session else "N/A",
+            )
+
+    async def _drain_dave_queue(self) -> None:
+        """Decrypt and forward buffered audio packets now that encryption keys are ready.
+
+        Audio packets that arrived before we knew which Discord user sent them are
+        buffered. This is called after a key-rotation commit or welcome establishes
+        the encryption keys. Packets whose audio stream is still unmapped stay buffered
+        and are processed lazily in ``unpack_audio`` when the next packet arrives.
+        """
+        if not self._dave_raw_queue or self.dave_session is None or not self.decoder:
+            return
+        for ssrc in list(self._dave_raw_queue.keys()):
+            user_id = self.ws.ssrc_map.get(ssrc, {}).get("user_id")
+            if user_id is None:
+                continue
+            packets = self._dave_raw_queue.pop(ssrc, [])
+            drained = 0
+            for queued_packet in packets:
+                queued_packet.user_id = user_id
+                transport_decrypted = queued_packet.decrypted_data
+                dave_decrypted = self.dave_session.decrypt_opus(user_id, transport_decrypted)
+                if dave_decrypted is None:
+                    continue
+                if dave_decrypted == transport_decrypted:
+                    # Passthrough: DAVE-framed unencrypted packet; drop it.
+                    continue
+                queued_packet.decrypted_data = dave_decrypted
+                if queued_packet.decrypted_data == b"\xf8\xff\xfe":
+                    continue
+                self.decoder.decode(queued_packet)
+                drained += 1
+            _log.debug(
+                "DAVE: _drain_dave_queue ssrc=%d uid=%d drained=%d/%d",
+                ssrc,
+                user_id,
+                drained,
+                len(packets),
+            )
 
     # audio related
 
@@ -789,6 +963,57 @@ class VoiceClient(VoiceProtocol):
             return
 
         data = RawData(data, self)
+
+        # ── DAVE E2EE decrypt ─────────────────────────────────────────────
+        if self.dave_session is not None:
+            ssrc = data.ssrc
+            user_id = self.ws.ssrc_map.get(ssrc, {}).get("user_id")
+
+            if user_id is None:
+                # We don't yet know which Discord user owns this audio stream — buffer the frame.
+                total = sum(len(v) for v in self._dave_raw_queue.values())
+                if total >= DAVE_QUEUE_MAX_TOTAL:
+                    # Buffer full: drop the oldest packet from the stream with the most backlog.
+                    evict = max(self._dave_raw_queue, key=lambda s: len(self._dave_raw_queue[s]))
+                    self._dave_raw_queue[evict].pop(0)
+                    if not self._dave_raw_queue[evict]:
+                        del self._dave_raw_queue[evict]
+                per = self._dave_raw_queue.setdefault(ssrc, [])
+                if len(per) >= DAVE_QUEUE_MAX_PER_SSRC:
+                    per.pop(0)  # Per-stream cap: drop oldest if this stream's buffer is also full.
+                per.append(data)
+                return
+
+            # We now know the user — decrypt any buffered frames for this stream first.
+            if ssrc in self._dave_raw_queue:
+                queued = self._dave_raw_queue.pop(ssrc)
+                _log.debug(
+                    "DAVE: lazy drain %d queued frames ssrc=%d uid=%d",
+                    len(queued), ssrc, user_id,
+                )
+                for queued_packet in queued:
+                    queued_packet.user_id = user_id
+                    transport_decrypted = queued_packet.decrypted_data
+                    dave_decrypted = self.dave_session.decrypt_opus(user_id, transport_decrypted)
+                    if dave_decrypted is None:
+                        continue
+                    if dave_decrypted == transport_decrypted:
+                        # Unencrypted packet in a DAVE wrapper — not real audio, drop it.
+                        continue
+                    queued_packet.decrypted_data = dave_decrypted
+                    if queued_packet.decrypted_data == b"\xf8\xff\xfe":
+                        continue
+                    self.decoder.decode(queued_packet)
+
+            transport_decrypted = data.decrypted_data
+            dave_decrypted = self.dave_session.decrypt_opus(user_id, transport_decrypted)
+            if dave_decrypted is None:
+                return  # drop: wrong key, replay, or encryption key not yet established
+            if dave_decrypted == transport_decrypted:
+                # Unencrypted packet in a DAVE wrapper — not real audio, drop it.
+                return
+            data.decrypted_data = dave_decrypted
+        # ──────────────────────────────────────────────────────────────────
 
         if data.decrypted_data == b"\xf8\xff\xfe":  # Frame of silence
             return

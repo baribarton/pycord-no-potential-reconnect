@@ -41,6 +41,7 @@ import aiohttp
 
 from . import utils
 from .activity import BaseActivity
+from .dave_session import DaveSession, has_dave, MAX_DAVE_PROTOCOL_VERSION
 from .enums import SpeakingState
 from .errors import ConnectionClosed, InvalidArgument
 
@@ -774,12 +775,40 @@ class DiscordVoiceWebSocket:
         Receive only. Tells you that your websocket connection was acknowledged.
     RESUMED
         Sent only. Tells you that your RESUME request has succeeded.
+    CLIENTS_CONNECT
+        Receive only. One or more users joined the voice channel (used to track who is in the encrypted group).
     CLIENT_CONNECT
         Indicates a user has connected to voice.
     CLIENT_DISCONNECT
         Receive only.  Indicates a user has disconnected from voice.
+    DAVE_PREPARE_TRANSITION
+        Receive only. Server announces an upcoming encryption protocol change.
+    DAVE_EXECUTE_TRANSITION
+        Receive only. Apply the encryption protocol change that was announced earlier.
+    DAVE_TRANSITION_READY
+        Send only. Acknowledge to the server that we are ready for the encryption change.
+    DAVE_PREPARE_EPOCH
+        Receive only. Server announces the encryption key group is about to rotate or be rebuilt.
+    MLS_EXTERNAL_SENDER
+        Receive only (binary). Server's signing authority credentials — used to validate key-exchange messages.
+    MLS_KEY_PACKAGE
+        Send only (binary). This client's public cryptographic credentials for joining the encrypted group.
+    MLS_PROPOSALS
+        Receive only (binary). Server-requested membership changes (add or remove users from the encrypted group).
+    MLS_COMMIT_WELCOME
+        Send only (binary). Our acceptance of the membership changes, plus an invite for any newly added users.
+    MLS_ANNOUNCE_COMMIT_TRANSITION
+        Receive only (binary). Server broadcasts a key-rotation commit with a transition ID.
+    MLS_WELCOME
+        Receive only (binary). Personalised invite carrying the current group encryption key for this client.
+    MLS_INVALID_COMMIT_WELCOME
+        Send only (JSON). Tell the server that the commit or welcome we received was invalid.
+
+    Binary frame layout (server→client): ``[uint16 BE seq_ack][uint8 op][payload]``.
+    Client→server binary: ``[uint8 op][payload]``.
     """
 
+    # Standard voice opcodes
     IDENTIFY = 0
     SELECT_PROTOCOL = 1
     READY = 2
@@ -790,8 +819,21 @@ class DiscordVoiceWebSocket:
     RESUME = 7
     HELLO = 8
     RESUMED = 9
-    CLIENT_CONNECT = 12
-    CLIENT_DISCONNECT = 13
+    # DAVE protocol opcodes
+    CLIENTS_CONNECT = 11                  # JSON  S→C  multiple users connected
+    CLIENT_CONNECT = 12                   # JSON  S→C  single user connected (legacy)
+    CLIENT_DISCONNECT = 13               # JSON  S→C
+    DAVE_PREPARE_TRANSITION = 21         # JSON  S→C
+    DAVE_EXECUTE_TRANSITION = 22         # JSON  S→C
+    DAVE_TRANSITION_READY = 23           # JSON  C→S
+    DAVE_PREPARE_EPOCH = 24              # JSON  S→C
+    MLS_EXTERNAL_SENDER = 25             # Binary S→C  [seq16][op][ExternalSender]
+    MLS_KEY_PACKAGE = 26                 # Binary C→S  [op][KeyPackage]
+    MLS_PROPOSALS = 27                   # Binary S→C  [seq16][op][op_type][data]
+    MLS_COMMIT_WELCOME = 28              # Binary C→S  [op][commit][welcome?]
+    MLS_ANNOUNCE_COMMIT_TRANSITION = 29  # Binary S→C  [seq16][op][tid16][commit]
+    MLS_WELCOME = 30                     # Binary S→C  [seq16][op][tid16][welcome]
+    MLS_INVALID_COMMIT_WELCOME = 31      # JSON  C→S
 
     def __init__(self, socket, loop, *, hook=None):
         self.ws = socket
@@ -801,6 +843,9 @@ class DiscordVoiceWebSocket:
         self.secret_key = None
         self.ssrc_map = {}
         self.seq_ack: int = -1
+        # Discord user IDs currently in the encrypted group — used to validate membership changes.
+        self.dave_known_user_ids: set[int] = set()
+        self.last_dave_op: int = -1
         if hook:
             self._hook = hook
 
@@ -810,6 +855,18 @@ class DiscordVoiceWebSocket:
     async def send_as_json(self, data):
         _log.debug("Sending voice websocket frame: %s.", data)
         await self.ws.send_str(utils._to_json(data))
+
+    async def send_binary(self, opcode: int, data: bytes) -> None:
+        """Send a binary voice websocket frame (client→server format).
+
+        Client→server binary format: ``[uint8 opcode][payload]`` — no seq prefix.
+        """
+        _log.debug(
+            "Sending voice websocket binary frame: op=%d size=%d",
+            opcode,
+            len(data),
+        )
+        await self.ws.send_bytes(bytes([opcode]) + data)
 
     send_heartbeat = send_as_json
 
@@ -821,8 +878,6 @@ class DiscordVoiceWebSocket:
                 "token": state.token,
                 "server_id": str(state.server_id),
                 "session_id": state.session_id,
-                # this seq_ack will allow for us to do buffered resume, which is, receive the
-                # lost voice packets while trying to resume the reconnection
                 "seq_ack": self.seq_ack,
             },
         }
@@ -837,13 +892,19 @@ class DiscordVoiceWebSocket:
                 "user_id": str(state.user.id),
                 "session_id": state.session_id,
                 "token": state.token,
+                # 0 when davey is not installed (non-E2EE fallback).
+                "max_dave_protocol_version": MAX_DAVE_PROTOCOL_VERSION,
             },
         }
         await self.send_as_json(payload)
 
     @classmethod
-    async def from_client(cls, client, *, resume=False, hook=None):
-        """Creates a voice websocket for the :class:`VoiceClient`."""
+    async def from_client(cls, client, *, resume=False, hook=None, seq_ack: int = -1):
+        """Creates a voice websocket for the :class:`VoiceClient`.
+
+        When resuming, ``seq_ack`` must be carried from the old ws so the
+        gateway replays any binary DAVE frames missed during the disconnect.
+        """
         gateway = f"wss://{client.endpoint}/?v=8"
         http = client._state.http
         socket = await http.ws_connect(gateway, compress=15)
@@ -852,6 +913,7 @@ class DiscordVoiceWebSocket:
         ws._connection = client
         ws._max_heartbeat_timeout = 60.0
         ws.thread_id = threading.get_ident()
+        ws.seq_ack = seq_ack
 
         if resume:
             await ws.resume()
@@ -890,11 +952,24 @@ class DiscordVoiceWebSocket:
 
         await self.send_as_json(payload)
 
+    async def send_transition_ready(self, transition_id: int) -> None:
+        """Tell the server we are ready for the announced encryption change.
+
+        Sent in response to DAVE_PREPARE_TRANSITION (op 21) or after
+        successfully applying a key-rotation commit (op 29) or welcome (op 30).
+        """
+        payload = {
+            "op": self.DAVE_TRANSITION_READY,
+            "d": {"transition_id": transition_id},
+        }
+        _log.debug("DAVE: sending transition_ready transition_id=%d", transition_id)
+        await self.send_as_json(payload)
+
     async def received_message(self, msg):
         _log.debug("Voice websocket frame received: %s", msg)
         op = msg["op"]
         data = msg.get("d")
-        self.seq_ack = data.get("seq", self.seq_ack)
+        self.seq_ack = data.get("seq", self.seq_ack) if isinstance(data, dict) else self.seq_ack
 
         if op == self.READY:
             await self.initial_connection(data)
@@ -921,7 +996,205 @@ class DiscordVoiceWebSocket:
             else:
                 self.ssrc_map.update({ssrc: {"user_id": user, "speaking": speaking}})
 
+        # ── DAVE JSON opcodes ─────────────────────────────────────────────
+
+        elif op == self.CLIENTS_CONNECT:
+            # Track which Discord users are in the encrypted group.
+            user_ids = data.get("user_ids", [])
+            for user_id in user_ids:
+                self.dave_known_user_ids.add(int(user_id))
+            _log.debug("DAVE: clients_connect user_ids=%s", user_ids)
+            self.last_dave_op = op
+
+        elif op == self.CLIENT_DISCONNECT:
+            user_id = data.get("user_id")
+            if user_id is not None:
+                self.dave_known_user_ids.discard(int(user_id))
+            _log.debug("DAVE: client_disconnect user_id=%s", user_id)
+            self.last_dave_op = op
+
+        elif op == self.DAVE_PREPARE_TRANSITION:
+            transition_id = data["transition_id"]
+            protocol_version = data["protocol_version"]
+            self.last_dave_op = op
+            _log.debug(
+                "DAVE: prepare_transition id=%d protocol_version=%d",
+                transition_id,
+                protocol_version,
+            )
+            voice_client = self._connection
+            voice_client.dave_pending_transitions[transition_id] = protocol_version
+            if protocol_version == 0 and voice_client.dave_session:
+                # Downgrading to non-E2EE: temporarily allow unencrypted audio while the change completes.
+                voice_client.dave_session.set_passthrough_mode(True, 120)
+            if transition_id == 0:
+                # Initialisation transition: execute immediately without waiting.
+                await voice_client._execute_transition(transition_id)
+            else:
+                await self.send_transition_ready(transition_id)
+
+        elif op == self.DAVE_EXECUTE_TRANSITION:
+            transition_id = data["transition_id"]
+            self.last_dave_op = op
+            _log.debug("DAVE: execute_transition id=%d", transition_id)
+            await self._connection._execute_transition(transition_id)
+
+        elif op == self.DAVE_PREPARE_EPOCH:
+            # epoch=1 means the encrypted group is being built (or rebuilt) from scratch.
+            epoch = data["epoch"]
+            protocol_version = data["protocol_version"]
+            self.last_dave_op = op
+            _log.debug(
+                "DAVE: prepare_epoch epoch=%d protocol_version=%d",
+                epoch,
+                protocol_version,
+            )
+            if epoch == 1:
+                self._connection.dave_protocol_version = protocol_version
+                await self._connection.reinit_dave_session(ws=self)
+
         await self._hook(self, msg)
+
+    async def received_binary_message(self, msg: bytes) -> None:
+        """Handle a binary WebSocket frame from the voice gateway.
+
+        Server→Client binary layout: ``[uint16 BE seq][uint8 op][payload]``.
+        """
+        if len(msg) < 3:
+            _log.warning("DAVE: binary frame too short (%d bytes), ignoring", len(msg))
+            return
+
+        self.seq_ack = struct.unpack_from(">H", msg, 0)[0]
+        binary_opcode = msg[2]
+        self.last_dave_op = binary_opcode
+        voice_client = self._connection
+
+        if binary_opcode == self.MLS_EXTERNAL_SENDER:
+            if voice_client.dave_session is None:
+                _log.warning("DAVE: MLS_EXTERNAL_SENDER but no dave_session, ignoring")
+                return
+            try:
+                voice_client.dave_session.set_external_sender(msg[3:])
+            except ValueError as exc:
+                _log.error("DAVE: set_external_sender failed: %s", exc)
+
+        elif binary_opcode == self.MLS_PROPOSALS:
+            # op_type byte: 0 = add user, 1 = remove user.
+            if len(msg) < 4:
+                _log.warning("DAVE: MLS_PROPOSALS too short (%d bytes)", len(msg))
+                return
+            if voice_client.dave_session is None:
+                _log.warning("DAVE: MLS_PROPOSALS but no dave_session, ignoring")
+                return
+            operation_type = msg[3]
+            proposal_data = msg[4:]
+            try:
+                result = voice_client.dave_session.process_proposals(operation_type, proposal_data)
+            except ValueError as exc:
+                _log.error("DAVE: process_proposals failed: %s", exc)
+                return
+            if result is not None:
+                commit, welcome = result
+                # Op 28: C→S commit + optional welcome.
+                payload = commit + (welcome if welcome is not None else b"")
+                await self.send_binary(self.MLS_COMMIT_WELCOME, payload)
+                _log.debug(
+                    "DAVE: sent MLS_COMMIT_WELCOME commit=%d bytes welcome=%s",
+                    len(commit),
+                    welcome is not None,
+                )
+
+        elif binary_opcode == self.MLS_ANNOUNCE_COMMIT_TRANSITION:
+            if len(msg) < 5:
+                _log.warning("DAVE: MLS_ANNOUNCE_COMMIT_TRANSITION too short (%d bytes)", len(msg))
+                return
+            if voice_client.dave_session is None:
+                _log.debug("DAVE: MLS_ANNOUNCE_COMMIT_TRANSITION but no dave_session, ignoring")
+                return
+            transition_id = struct.unpack_from(">H", msg, 3)[0]
+            commit = msg[5:]
+            _log.debug(
+                "DAVE: announce_commit_transition id=%d commit_len=%d",
+                transition_id,
+                len(commit),
+            )
+            try:
+                voice_client.dave_session.process_commit(commit)
+            except ValueError as exc:
+                _log.warning(
+                    "DAVE: process_commit failed (transition_id=%d): %s",
+                    transition_id,
+                    exc,
+                )
+                await self._recover_from_invalid_commit(transition_id)
+                return
+            if voice_client.dave_session.ready:
+                await voice_client._drain_dave_queue()
+            # Temporarily allow unencrypted audio while the new encryption key is being applied.
+            voice_client.dave_session.set_passthrough_mode(True, 10)
+            # Register the transition so EXECUTE_TRANSITION (op 22) can match it — new members don't receive PREPARE_TRANSITION (op 21).
+            voice_client.dave_pending_transitions.setdefault(transition_id, voice_client.dave_protocol_version)
+            # Acknowledge the key rotation to the server.
+            await self.send_transition_ready(transition_id)
+
+        elif binary_opcode == self.MLS_WELCOME:
+            if len(msg) < 5:
+                _log.warning("DAVE: MLS_WELCOME too short (%d bytes)", len(msg))
+                return
+            if voice_client.dave_session is None:
+                _log.debug("DAVE: MLS_WELCOME but no dave_session, ignoring")
+                return
+            transition_id = struct.unpack_from(">H", msg, 3)[0]
+            welcome = msg[5:]
+            _log.debug(
+                "DAVE: mls_welcome transition_id=%d welcome_len=%d",
+                transition_id,
+                len(welcome),
+            )
+            try:
+                voice_client.dave_session.process_welcome(welcome)
+            except ValueError as exc:
+                _log.warning(
+                    "DAVE: process_welcome failed (transition_id=%d): %s",
+                    transition_id,
+                    exc,
+                )
+                await self._recover_from_invalid_commit(transition_id)
+                return
+            if voice_client.dave_session.ready:
+                await voice_client._drain_dave_queue()
+            # Temporarily allow unencrypted audio while the new encryption key is being applied.
+            voice_client.dave_session.set_passthrough_mode(True, 10)
+            # Register the transition so EXECUTE_TRANSITION (op 22) can match it — new members don't receive PREPARE_TRANSITION (op 21).
+            voice_client.dave_pending_transitions.setdefault(transition_id, voice_client.dave_protocol_version)
+            # Acknowledge the key rotation to the server.
+            await self.send_transition_ready(transition_id)
+
+        else:
+            _log.debug("DAVE: unknown binary opcode %d (%d bytes), ignoring", binary_opcode, len(msg))
+
+    async def _recover_from_invalid_commit(self, transition_id: int) -> None:
+        """Tell the server a key-exchange message was invalid, reset local state, and reconnect.
+
+        Sends MLS_INVALID_COMMIT_WELCOME (op 31) to report the bad message, resets the
+        encryption session, then closes the voice WebSocket (code 4000) to force a full
+        reconnect. The reconnect is necessary because Discord does not reliably send a new
+        DAVE_PREPARE_EPOCH after op 31 — without it the session would be stuck with no
+        encryption keys and all audio failing to decrypt.
+        """
+        await self.send_as_json(
+            {"op": self.MLS_INVALID_COMMIT_WELCOME, "d": {"transition_id": transition_id}}
+        )
+        voice_client = self._connection
+        if voice_client.dave_session is not None:
+            voice_client.dave_session.reset()
+        voice_client._reset_reconnect_backoff()
+        _log.warning(
+            "DAVE: MLS_INVALID_COMMIT_WELCOME sent for transition_id=%d, session reset — "
+            "closing voice WS to force reconnect",
+            transition_id,
+        )
+        await self.close(4000)
 
     async def initial_connection_v1(self, data):
         state = self._connection
@@ -1041,6 +1314,14 @@ class DiscordVoiceWebSocket:
     async def load_secret_key(self, data):
         _log.info("received secret key for voice connection")
         self.secret_key = self._connection.secret_key = data.get("secret_key")
+
+        # dave_protocol_version > 0 means DAVE E2EE is active for this channel.
+        dave_version = data.get("dave_protocol_version", 0)
+        if dave_version > 0:
+            _log.debug("DAVE: SESSION_DESCRIPTION dave_protocol_version=%d", dave_version)
+            self._connection.dave_protocol_version = dave_version
+            await self._connection.reinit_dave_session(ws=self)
+
         await self.speak()
         await self.speak(False)
 
@@ -1049,6 +1330,8 @@ class DiscordVoiceWebSocket:
         msg = await asyncio.wait_for(self.ws.receive(), timeout=30.0)
         if msg.type is aiohttp.WSMsgType.TEXT:
             await self.received_message(utils._from_json(msg.data))
+        elif msg.type is aiohttp.WSMsgType.BINARY:
+            await self.received_binary_message(msg.data)
         elif msg.type is aiohttp.WSMsgType.ERROR:
             _log.debug("Received %s", msg)
             raise ConnectionClosed(self.ws, shard_id=None) from msg.data
