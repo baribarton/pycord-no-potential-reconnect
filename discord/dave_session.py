@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Optional
 
 _log = logging.getLogger(__name__)
@@ -44,6 +45,25 @@ DAVE_QUEUE_MAX_PER_SSRC: int = 32
 #: Maximum total buffered packets across all audio streams.
 DAVE_QUEUE_MAX_TOTAL: int = 256
 
+#: Seconds of failures with no successes before a user counts as cut off.
+STUCK_USER_SECONDS: float = 180.0
+
+#: Log a user's first few decrypt failures, then only every Nth, so one cut-off user
+#: cannot fill the log with fifty identical lines a second.
+DECRYPT_FAILURES_LOGGED_IN_FULL: int = 5
+DECRYPT_FAILURE_LOG_INTERVAL: int = 1000
+
+
+class _DecryptFailures:
+    """One user's unbroken run of decrypt failures. Discarded as soon as they decrypt again."""
+
+    __slots__ = ("started_at", "count", "reported")
+
+    def __init__(self) -> None:
+        self.started_at = time.monotonic()
+        self.count = 0
+        self.reported = False
+
 
 # ---------------------------------------------------------------------------
 # Live adapter
@@ -61,6 +81,7 @@ class DaveSession:
         protocol_version: int,
         user_id: int,
         channel_id: int,
+        guild_id: Optional[int] = None,
     ) -> None:
         if not has_dave:
             raise RuntimeError(
@@ -74,11 +95,14 @@ class DaveSession:
         self._lock = threading.Lock()
         self._decrypt_ok: dict[int, int] = {}
         self._decrypt_fail: dict[int, int] = {}
+        self._current_failures: dict[int, _DecryptFailures] = {}
+        self._guild_id = guild_id
         _log.debug(
-            "DaveSession created: protocol_version=%d user_id=%d channel_id=%d",
+            "DaveSession created: protocol_version=%d user_id=%d channel_id=%d guild_id=%s",
             protocol_version,
             user_id,
             channel_id,
+            guild_id,
         )
 
     # ── read-only state ──────────────────────────────────────────────────────
@@ -180,7 +204,10 @@ class DaveSession:
         """
         self._davey_session.process_commit(commit)
         _log.debug(
-            "DAVE: commit processed, epoch=%s ready=%s", self.epoch, self.ready
+            "DAVE: commit processed, epoch=%s ready=%s guild_id=%s",
+            self.epoch,
+            self.ready,
+            self._guild_id,
         )
 
     def process_welcome(self, welcome: bytes) -> None:
@@ -196,7 +223,10 @@ class DaveSession:
         """
         self._davey_session.process_welcome(welcome)
         _log.debug(
-            "DAVE: welcome processed, epoch=%s ready=%s", self.epoch, self.ready
+            "DAVE: welcome processed, epoch=%s ready=%s guild_id=%s",
+            self.epoch,
+            self.ready,
+            self._guild_id,
         )
 
     # ── media decrypt (recording path) ───────────────────────────────────────
@@ -228,28 +258,115 @@ class DaveSession:
             try:
                 result = self._davey_session.decrypt(user_id, _davey.MediaType.audio, data)
                 self._decrypt_ok[user_id] = self._decrypt_ok.get(user_id, 0) + 1
+                self._current_failures.pop(user_id, None)
                 return result
             except ValueError as exc:
-                self._decrypt_fail[user_id] = self._decrypt_fail.get(user_id, 0) + 1
+                failures = self._record_failure(user_id)
                 error_message = str(exc)
-                if "NoDecryptorForUser" in error_message:
+                if failures and "NoDecryptorForUser" in error_message:
                     # Expected during key exchange — this user's encryption key isn't set up yet.
-                    _log.debug("DAVE decrypt: no decryptor yet uid=%d (handshake pending)", user_id)
-                elif "DuplicateNonce" in error_message:
+                    _log.debug(
+                        "DAVE decrypt: no decryptor yet (handshake pending) uid=%d guild_id=%s failure=%d",
+                        user_id,
+                        self._guild_id,
+                        failures,
+                    )
+                elif failures and "DuplicateNonce" in error_message:
                     # Replay protection: this packet counter was already seen, so drop it.
-                    _log.debug("DAVE decrypt: duplicate nonce uid=%d", user_id)
-                elif "NoValidCryptorFound" in error_message:
-                    # Key rotation in progress — old key expired, new one not yet applied.
-                    _log.debug("DAVE decrypt: no valid cryptor uid=%d (epoch transition)", user_id)
-                else:
+                    _log.debug(
+                        "DAVE decrypt: duplicate nonce uid=%d guild_id=%s failure=%d",
+                        user_id,
+                        self._guild_id,
+                        failures,
+                    )
+                elif failures and "NoValidCryptorFound" in error_message:
+                    # We hold a key for this user but it will not open this frame.
+                    _log.debug(
+                        "DAVE decrypt: no valid cryptor uid=%d guild_id=%s failure=%d",
+                        user_id,
+                        self._guild_id,
+                        failures,
+                    )
+                elif failures:
                     # DecryptionFailed or unknown — worth knowing about.
-                    _log.warning("DAVE decrypt failed uid=%d: %s", user_id, exc)
+                    _log.warning(
+                        "DAVE decrypt failed uid=%d guild_id=%s failure=%d: %s",
+                        user_id,
+                        self._guild_id,
+                        failures,
+                        exc,
+                    )
                 return None
             except Exception as exc:
                 # Drop rather than crash the recv thread.
-                self._decrypt_fail[user_id] = self._decrypt_fail.get(user_id, 0) + 1
-                _log.error("DAVE decrypt unexpected error uid=%d: %s", user_id, exc)
+                failures = self._record_failure(user_id)
+                if failures:
+                    _log.error(
+                        "DAVE decrypt unexpected error uid=%d guild_id=%s: %s",
+                        user_id,
+                        self._guild_id,
+                        exc,
+                    )
                 return None
+
+    def _record_failure(self, user_id: int) -> int:
+        """Count a decrypt failure and return its number, or 0 if it should not be logged.
+
+        Also reports a user whose audio has not decrypted at all for a long time, once per
+        run of failures. Key rotation never fails for long enough to qualify.
+        """
+        self._decrypt_fail[user_id] = self._decrypt_fail.get(user_id, 0) + 1
+        failures = self._current_failures.get(user_id)
+        if failures is None:
+            failures = self._current_failures[user_id] = _DecryptFailures()
+        failures.count += 1
+
+        if (
+            not failures.reported
+            and time.monotonic() - failures.started_at >= STUCK_USER_SECONDS
+        ):
+            failures.reported = True
+            _log.warning(
+                "DAVE: no audio can be decrypted for this user: %s",
+                self._describe(user_id),
+            )
+
+        if (
+            failures.count <= DECRYPT_FAILURES_LOGGED_IN_FULL
+            or failures.count % DECRYPT_FAILURE_LOG_INTERVAL == 0
+        ):
+            return failures.count
+        return 0
+
+    def _describe(self, user_id: int) -> str:
+        """Describe why one user's audio will not decrypt.
+
+        ``in_group`` is the useful part: a user missing from the encrypted group was
+        never given to us, while one present means our key for them does not work.
+        """
+        try:
+            group_user_ids = [int(uid) for uid in self._davey_session.get_user_ids()]
+            in_group = user_id in group_user_ids
+        except Exception as exc:
+            group_user_ids, in_group = [], f"unknown ({exc})"
+
+        try:
+            stats = self._davey_session.get_decryption_stats(
+                user_id, _davey.MediaType.audio
+            )
+            stats_text = (
+                f"successes={stats.successes} failures={stats.failures} "
+                f"attempts={stats.attempts} passthroughs={stats.passthroughs}"
+            )
+        except Exception:
+            stats_text = "unavailable"
+
+        return (
+            f"uid={user_id} guild_id={self._guild_id} in_group={in_group} "
+            f"epoch={self.epoch} ready={self.ready} status={self.status_name} "
+            f"group_size={len(group_user_ids)} group={group_user_ids} "
+            f"davey[{stats_text}]"
+        )
 
     def can_passthrough(self, user_id: int) -> bool:
         """Whether unencrypted audio frames should be accepted for this user.
@@ -275,6 +392,7 @@ class DaveSession:
         self._davey_session.reset()
         self._decrypt_ok.clear()
         self._decrypt_fail.clear()
+        self._current_failures.clear()
         _log.debug("DAVE: session reset")
 
     def reinit(
@@ -282,6 +400,7 @@ class DaveSession:
         protocol_version: int,
         user_id: int,
         channel_id: int,
+        guild_id: Optional[int] = None,
     ) -> None:
         """Re-initialise in place with new session parameters (equivalent to reset + reconfigure).
 
@@ -292,11 +411,14 @@ class DaveSession:
         self._davey_session.reinit(protocol_version, user_id, channel_id)
         self._decrypt_ok.clear()
         self._decrypt_fail.clear()
+        self._current_failures.clear()
+        self._guild_id = guild_id
         _log.debug(
-            "DAVE: session reinit protocol_version=%d user_id=%d channel_id=%d",
+            "DAVE: session reinit protocol_version=%d user_id=%d channel_id=%d guild_id=%s",
             protocol_version,
             user_id,
             channel_id,
+            guild_id,
         )
 
     # ── metrics ──────────────────────────────────────────────────────────────
