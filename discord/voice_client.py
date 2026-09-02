@@ -643,12 +643,15 @@ class VoiceClient(VoiceProtocol):
             )
         user_id = self.user.id
         channel_id = self.channel.id
+        guild_id = self.guild.id if self.guild else None
         if self.dave_session is None:
             self.dave_session = DaveSession(
-                self.dave_protocol_version, user_id, channel_id
+                self.dave_protocol_version, user_id, channel_id, guild_id
             )
         else:
-            self.dave_session.reinit(self.dave_protocol_version, user_id, channel_id)
+            self.dave_session.reinit(
+                self.dave_protocol_version, user_id, channel_id, guild_id
+            )
 
         # Send our public credentials to the server so it can add us to the encrypted group (op 26).
         key_package = self.dave_session.get_key_package()
