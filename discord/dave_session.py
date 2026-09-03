@@ -258,7 +258,10 @@ class DaveSession:
             try:
                 result = self._davey_session.decrypt(user_id, _davey.MediaType.audio, data)
                 self._decrypt_ok[user_id] = self._decrypt_ok.get(user_id, 0) + 1
-                self._current_failures.pop(user_id, None)
+
+                # Only real decrypted audio means this user is being heard again.
+                if result != data:
+                    self._current_failures.pop(user_id, None)
                 return result
             except ValueError as exc:
                 failures = self._record_failure(user_id)
