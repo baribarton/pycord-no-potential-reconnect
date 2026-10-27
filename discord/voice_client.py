@@ -846,7 +846,7 @@ class VoiceClient(VoiceProtocol):
         We strip a fixed 8 bytes of header extension before decrypting, so a sender whose
         client sends a different amount cannot be decrypted at all.
         """
-        if not self.mode.endswith("_rtpsize") or not header:
+        if not self.mode.endswith("_rtpsize") or len(header) < 12:
             return
 
         extended = bool(header[0] & 0b00_0_1_0000)
