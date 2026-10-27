@@ -285,18 +285,24 @@ class DaveSession:
                 elif failures and "NoValidCryptorFound" in error_message:
                     # We hold a key for this user but it will not open this frame.
                     _log.debug(
-                        "DAVE decrypt: no valid cryptor uid=%d guild_id=%s failure=%d",
+                        "DAVE decrypt: no valid cryptor uid=%d guild_id=%s failure=%d"
+                        " frame_bytes=%d frame_tail=%s",
                         user_id,
                         self._guild_id,
                         failures,
+                        len(data),
+                        data[-4:].hex(),
                     )
                 elif failures:
                     # DecryptionFailed or unknown — worth knowing about.
                     _log.warning(
-                        "DAVE decrypt failed uid=%d guild_id=%s failure=%d: %s",
+                        "DAVE decrypt failed uid=%d guild_id=%s failure=%d"
+                        " frame_bytes=%d frame_tail=%s: %s",
                         user_id,
                         self._guild_id,
                         failures,
+                        len(data),
+                        data[-4:].hex(),
                         exc,
                     )
                 return None
