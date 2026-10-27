@@ -280,6 +280,8 @@ class VoiceClient(VoiceProtocol):
         self.dave_pending_transitions: dict[int, int] = {}
         # Packets buffered while we wait to learn which Discord user owns each audio stream.
         self._dave_raw_queue: dict[int, list] = {}
+        # Last RTP header shape seen per audio stream, to report only when it changes.
+        self._rtp_header_shape: dict[int, tuple[bool, bool, int]] = {}
         self._poll_backoff: ExponentialBackoff = ExponentialBackoff()
 
     warn_nacl = not has_nacl
@@ -837,6 +839,34 @@ class VoiceClient(VoiceProtocol):
         # This can be removed, and at this time, discarded as it is unclear what they are for.
         return r[8:]
 
+    def report_rtp_header_shape(self, ssrc: int, header: bytes) -> None:
+        """Log how much of this stream's packet is header, when it first differs from before.
+
+        We strip a fixed 8 bytes of header extension before decrypting, so a sender whose
+        client sends a different amount cannot be decrypted at all.
+        """
+        if not self.mode.endswith("_rtpsize") or not header:
+            return
+
+        padded = bool(header[0] & 0b00_1_0_0000)
+        extended = bool(header[0] & 0b00_0_1_0000)
+        words = struct.unpack_from(">H", header, len(header) - 2)[0] if extended else 0
+        shape = (padded, extended, words)
+        if self._rtp_header_shape.get(ssrc) == shape:
+            return
+
+        self._rtp_header_shape[ssrc] = shape
+        _log.info(
+            "RTP header shape: ssrc=%d uid=%s guild_id=%s padded=%s extended=%s"
+            " extension_bytes=%d stripped=8",
+            ssrc,
+            self.ws.ssrc_map.get(ssrc, {}).get("user_id") if self.ws else None,
+            self.guild.id if self.guild else None,
+            padded,
+            extended,
+            words * 4,
+        )
+
     @staticmethod
     def strip_header_ext(data):
         if len(data) > 4 and data[0] == 0xBE and data[1] == 0xDE:
@@ -966,6 +996,7 @@ class VoiceClient(VoiceProtocol):
             return
 
         data = RawData(data, self)
+        self.report_rtp_header_shape(data.ssrc, data.header)
 
         # ── DAVE E2EE decrypt ─────────────────────────────────────────────
         if self.dave_session is not None:
