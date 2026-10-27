@@ -281,7 +281,8 @@ class VoiceClient(VoiceProtocol):
         # Packets buffered while we wait to learn which Discord user owns each audio stream.
         self._dave_raw_queue: dict[int, list] = {}
         # Last RTP header shape seen per audio stream, to report only when it changes.
-        self._rtp_header_shape: dict[int, tuple[bool, bool, int]] = {}
+        self._rtp_header_shape: dict[int, tuple[bool, int]] = {}
+        self._rtp_padded_streams: set[int] = set()
         self._poll_backoff: ExponentialBackoff = ExponentialBackoff()
 
     warn_nacl = not has_nacl
@@ -848,13 +849,18 @@ class VoiceClient(VoiceProtocol):
         if not self.mode.endswith("_rtpsize") or not header:
             return
 
-        padded = bool(header[0] & 0b00_1_0_0000)
         extended = bool(header[0] & 0b00_0_1_0000)
         words = struct.unpack_from(">H", header, len(header) - 2)[0] if extended else 0
-        shape = (padded, extended, words)
-        if self._rtp_header_shape.get(ssrc) == shape:
+        shape = (extended, words)
+
+        # Padding comes and goes packet to packet, so only the first padded one is news.
+        padded = bool(header[0] & 0b00_1_0_0000)
+        first_padded = padded and ssrc not in self._rtp_padded_streams
+        if self._rtp_header_shape.get(ssrc) == shape and not first_padded:
             return
 
+        if padded:
+            self._rtp_padded_streams.add(ssrc)
         self._rtp_header_shape[ssrc] = shape
         _log.info(
             "RTP header shape: ssrc=%d uid=%s guild_id=%s padded=%s extended=%s"
