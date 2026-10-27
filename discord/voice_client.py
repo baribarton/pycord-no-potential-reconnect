@@ -840,7 +840,7 @@ class VoiceClient(VoiceProtocol):
         # This can be removed, and at this time, discarded as it is unclear what they are for.
         return r[8:]
 
-    def report_rtp_header_shape(self, ssrc: int, header: bytes) -> None:
+    def _report_rtp_header_shape(self, ssrc: int, header: bytes) -> None:
         """Log how much of this stream's packet is header, when it first differs from before.
 
         We strip a fixed 8 bytes of header extension before decrypting, so a sender whose
@@ -1002,7 +1002,7 @@ class VoiceClient(VoiceProtocol):
             return
 
         data = RawData(data, self)
-        self.report_rtp_header_shape(data.ssrc, data.header)
+        self._report_rtp_header_shape(data.ssrc, data.header)
 
         # ── DAVE E2EE decrypt ─────────────────────────────────────────────
         if self.dave_session is not None:
