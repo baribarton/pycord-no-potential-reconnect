@@ -994,7 +994,8 @@ class DiscordVoiceWebSocket:
             if ssrc in self.ssrc_map:
                 known_user = self.ssrc_map[ssrc]["user_id"]
                 if known_user != user:
-                    # Audio is decrypted with its sender's key, so take the newest owner.
+                    # We keep the first user for an audio stream, so a reassigned stream
+                    # would be decrypted with the wrong person's key.
                     _log.warning(
                         "SSRC reassigned: ssrc=%d known_uid=%d new_uid=%d guild_id=%s",
                         ssrc,
@@ -1002,7 +1003,7 @@ class DiscordVoiceWebSocket:
                         user,
                         self._connection.guild.id if self._connection.guild else None,
                     )
-                self.ssrc_map[ssrc].update({"user_id": user, "speaking": speaking})
+                self.ssrc_map[ssrc]["speaking"] = speaking
             else:
                 self.ssrc_map.update({ssrc: {"user_id": user, "speaking": speaking}})
 
