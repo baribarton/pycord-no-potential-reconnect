@@ -92,6 +92,10 @@ __all__ = (
 
 _log = logging.getLogger(__name__)
 
+# RTP header shapes already reported, so a stream that keeps changing shape cannot flood the log.
+_REPORTED_RTP_SHAPES: set[tuple[int | None, int, bool, int, bool]] = set()
+_REPORTED_RTP_SHAPES_CAP = 2000
+
 
 class VoiceProtocol:
     """A class that represents the Discord voice protocol.
@@ -280,9 +284,6 @@ class VoiceClient(VoiceProtocol):
         self.dave_pending_transitions: dict[int, int] = {}
         # Packets buffered while we wait to learn which Discord user owns each audio stream.
         self._dave_raw_queue: dict[int, list] = {}
-        # Last RTP header shape seen per audio stream, to report only when it changes.
-        self._rtp_header_shape: dict[int, tuple[bool, int]] = {}
-        self._rtp_padded_streams: set[int] = set()
         self._poll_backoff: ExponentialBackoff = ExponentialBackoff()
 
     warn_nacl = not has_nacl
@@ -841,33 +842,32 @@ class VoiceClient(VoiceProtocol):
         return r[8:]
 
     def _report_rtp_header_shape(self, ssrc: int, header: bytes) -> None:
-        """Log how much of this stream's packet is header, when it first differs from before.
+        """Log how much of this stream's packet is header, once for each shape we see.
 
         We strip a fixed 8 bytes of header extension before decrypting, so a sender whose
-        client sends a different amount cannot be decrypted at all.
+        client sends a different amount loses part of its audio.
         """
         if not self.mode.endswith("_rtpsize") or len(header) < 12:
             return
 
         extended = bool(header[0] & 0b00_0_1_0000)
         words = struct.unpack_from(">H", header, len(header) - 2)[0] if extended else 0
-        shape = (extended, words)
-
-        # Padding comes and goes packet to packet, so only the first padded one is news.
         padded = bool(header[0] & 0b00_1_0_0000)
-        first_padded = padded and ssrc not in self._rtp_padded_streams
-        if self._rtp_header_shape.get(ssrc) == shape and not first_padded:
+        user_id = self.ws.ssrc_map.get(ssrc, {}).get("user_id") if self.ws else None
+        guild_id = self.guild.id if self.guild else None
+
+        # A stream can change shape packet to packet, so report on the shape, not on the change.
+        shape = (guild_id, user_id or ssrc, extended, words, padded)
+        if shape in _REPORTED_RTP_SHAPES or len(_REPORTED_RTP_SHAPES) >= _REPORTED_RTP_SHAPES_CAP:
             return
 
-        if padded:
-            self._rtp_padded_streams.add(ssrc)
-        self._rtp_header_shape[ssrc] = shape
-        _log.info(
+        _REPORTED_RTP_SHAPES.add(shape)
+        _log.debug(
             "RTP header shape: ssrc=%d uid=%s guild_id=%s padded=%s extended=%s"
             " extension_bytes=%d stripped=8",
             ssrc,
-            self.ws.ssrc_map.get(ssrc, {}).get("user_id") if self.ws else None,
-            self.guild.id if self.guild else None,
+            user_id,
+            guild_id,
             padded,
             extended,
             words * 4,
