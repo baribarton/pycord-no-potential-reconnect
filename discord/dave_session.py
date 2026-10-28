@@ -191,43 +191,101 @@ class DaveSession:
         _log.debug("DAVE: proposals processed → no commit")
         return None
 
-    def process_commit(self, commit: bytes) -> None:
+    def process_commit(self, commit: bytes) -> bool:
         """Apply a key-rotation commit broadcast by the server (op 29).
 
         A commit finalises pending membership changes and rotates the group's
         encryption key. Once applied, ``epoch`` increments and ``ready`` is ``True``.
+        The new key is staged, not switched to: call :meth:`prepare_transition` and
+        then :meth:`execute_transition` to start using it.
+
+        Returns
+        -------
+        bool
+            Whether a transition should be prepared for this commit.
 
         Raises
         ------
         ValueError
             If the commit is invalid or cannot be applied.
         """
-        self._davey_session.process_commit(commit)
+        should_prepare = self._davey_session.process_commit(commit)
         _log.debug(
-            "DAVE: commit processed, epoch=%s ready=%s guild_id=%s",
+            "DAVE: commit processed, epoch=%s ready=%s should_prepare=%s guild_id=%s",
             self.epoch,
             self.ready,
+            should_prepare,
             self._guild_id,
         )
+        return should_prepare
 
-    def process_welcome(self, welcome: bytes) -> None:
+    def process_welcome(
+        self,
+        welcome: bytes,
+        recognized_user_ids: Optional[list[int]] = None,
+    ) -> None:
         """Apply a welcome message that adds this client to the encrypted group (op 30).
 
         A welcome carries the current group encryption key, encrypted specifically for
-        this client. Once applied, ``epoch`` is set and ``ready`` is ``True``.
+        this client. Once applied, ``epoch`` is set and ``ready`` is ``True``. The key is
+        staged, not switched to: call :meth:`prepare_transition` and then
+        :meth:`execute_transition` to start using it.
+
+        Parameters
+        ----------
+        welcome: :class:`bytes`
+            The welcome message to apply.
+        recognized_user_ids: Optional[List[:class:`int`]]
+            The users we expect to find in the group. Any other member is rejected.
 
         Raises
         ------
         ValueError
             If the welcome is invalid or cannot be applied.
         """
-        self._davey_session.process_welcome(welcome)
+        self._davey_session.process_welcome(welcome, recognized_user_ids)
         _log.debug(
             "DAVE: welcome processed, epoch=%s ready=%s guild_id=%s",
             self.epoch,
             self.ready,
             self._guild_id,
         )
+
+    def prepare_transition(self, transition_id: int, protocol_version: int) -> None:
+        """Stage the key from a commit or welcome, ready to be switched to (op 21).
+
+        Raises
+        ------
+        ValueError
+            If there is nothing staged to prepare.
+        """
+        self._davey_session.prepare_transition(transition_id, protocol_version)
+        _log.debug(
+            "DAVE: transition prepared id=%d protocol_version=%d epoch=%s guild_id=%s",
+            transition_id,
+            protocol_version,
+            self.epoch,
+            self._guild_id,
+        )
+
+    def execute_transition(self, transition_id: int) -> bool:
+        """Switch to the key staged by :meth:`prepare_transition` (op 22).
+
+        Returns
+        -------
+        bool
+            Whether there was a prepared transition to switch to.
+        """
+        executed = self._davey_session.execute_transition(transition_id)
+        _log.debug(
+            "DAVE: transition executed id=%d executed=%s epoch=%s ready=%s guild_id=%s",
+            transition_id,
+            executed,
+            self.epoch,
+            self.ready,
+            self._guild_id,
+        )
+        return executed
 
     # ── media decrypt (recording path) ───────────────────────────────────────
 
@@ -366,7 +424,8 @@ class DaveSession:
             )
             stats_text = (
                 f"successes={stats.successes} failures={stats.failures} "
-                f"attempts={stats.attempts} passthroughs={stats.passthroughs}"
+                f"attempts={stats.attempts} passthroughs={stats.passthroughs} "
+                f"missing_keys={stats.missing_keys} invalid_nonces={stats.invalid_nonces}"
             )
         except Exception:
             stats_text = "unavailable"

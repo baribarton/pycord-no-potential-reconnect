@@ -42,6 +42,8 @@ class FakeDaveSession:
         self._key_package_calls: int = 0
         self._commit_calls: int = 0
         self._welcome_calls: int = 0
+        self._prepared_transitions: list[tuple[int, int]] = []
+        self._executed_transitions: list[int] = []
 
     @property
     def ready(self) -> bool:
@@ -69,15 +71,27 @@ class FakeDaveSession:
     ) -> Optional[tuple[bytes, Optional[bytes]]]:
         return (b"fake_commit", b"fake_welcome")
 
-    def process_commit(self, commit: bytes) -> None:
+    def process_commit(self, commit: bytes) -> bool:
         self._commit_calls += 1
         self._ready = True
         self._epoch = (self._epoch or 0) + 1
+        return True
 
-    def process_welcome(self, welcome: bytes) -> None:
+    def process_welcome(
+        self,
+        welcome: bytes,
+        recognized_user_ids: Optional[list[int]] = None,
+    ) -> None:
         self._welcome_calls += 1
         self._ready = True
         self._epoch = (self._epoch or 0) + 1
+
+    def prepare_transition(self, transition_id: int, protocol_version: int) -> None:
+        self._prepared_transitions.append((transition_id, protocol_version))
+
+    def execute_transition(self, transition_id: int) -> bool:
+        self._executed_transitions.append(transition_id)
+        return True
 
     def decrypt_opus(self, user_id: int, data: bytes) -> Optional[bytes]:
         if self.fail_decrypt:

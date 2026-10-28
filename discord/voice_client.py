@@ -701,6 +701,9 @@ class VoiceClient(VoiceProtocol):
         else:
             # Encryption session was already reinitialised at PREPARE_EPOCH; this activates the new version.
             self.dave_protocol_version = protocol_version
+            # The key a commit or welcome staged is not used until we switch to it here.
+            if self.dave_session is not None:
+                self.dave_session.execute_transition(transition_id)
             _log.info(
                 "DAVE: executing transition to protocol_version=%d (session.ready=%s)",
                 protocol_version,

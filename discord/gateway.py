@@ -1130,7 +1130,7 @@ class DiscordVoiceWebSocket:
                 len(commit),
             )
             try:
-                voice_client.dave_session.process_commit(commit)
+                should_prepare = voice_client.dave_session.process_commit(commit)
             except ValueError as exc:
                 _log.warning(
                     "DAVE: process_commit failed (transition_id=%d): %s",
@@ -1138,6 +1138,8 @@ class DiscordVoiceWebSocket:
                     exc,
                 )
                 await self._recover_from_invalid_commit(transition_id)
+                return
+            if should_prepare and not await self._prepare_transition(transition_id):
                 return
             if voice_client.dave_session.ready:
                 await voice_client._drain_dave_queue()
@@ -1172,6 +1174,8 @@ class DiscordVoiceWebSocket:
                 )
                 await self._recover_from_invalid_commit(transition_id)
                 return
+            if not await self._prepare_transition(transition_id):
+                return
             if voice_client.dave_session.ready:
                 await voice_client._drain_dave_queue()
             # Temporarily allow unencrypted audio while the new encryption key is being applied.
@@ -1183,6 +1187,34 @@ class DiscordVoiceWebSocket:
 
         else:
             _log.debug("DAVE: unknown binary opcode %d (%d bytes), ignoring", binary_opcode, len(msg))
+
+    async def _prepare_transition(self, transition_id: int) -> bool:
+        """Stage the key a commit or welcome just gave us, and say whether it worked.
+
+        A transition ID of zero has no announcement to wait for, so it is switched to
+        straight away. A failure here is reported to the server like a bad commit,
+        because carrying on would leave us decrypting with a key nobody is using.
+        """
+        voice_client = self._connection
+        try:
+            voice_client.dave_session.prepare_transition(
+                transition_id, voice_client.dave_protocol_version
+            )
+        except ValueError as exc:
+            _log.warning(
+                "DAVE: prepare_transition failed (transition_id=%d): %s",
+                transition_id,
+                exc,
+            )
+            await self._recover_from_invalid_commit(transition_id)
+            return False
+
+        if transition_id == 0:
+            voice_client.dave_pending_transitions.setdefault(
+                transition_id, voice_client.dave_protocol_version
+            )
+            await voice_client._execute_transition(transition_id)
+        return True
 
     async def _recover_from_invalid_commit(self, transition_id: int) -> None:
         """Tell the server a key-exchange message was invalid, reset local state, and reconnect.

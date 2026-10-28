@@ -60,6 +60,26 @@ class TestFakeDaveSessionBasics:
         assert s.ready is True
         assert s.epoch == 1
 
+    def test_process_commit_asks_for_a_transition(self):
+        s = self._make(start_ready=False)
+        assert s.process_commit(b"commit") is True
+
+    def test_process_welcome_takes_recognized_user_ids(self):
+        s = self._make(start_ready=False)
+        s.process_welcome(b"welcome", [111, 222])
+        assert s.ready is True
+
+    def test_prepare_transition_records_the_staged_key(self):
+        s = self._make()
+        s.prepare_transition(7, 1)
+        assert s._prepared_transitions == [(7, 1)]
+
+    def test_execute_transition_switches_to_the_staged_key(self):
+        s = self._make()
+        s.prepare_transition(7, 1)
+        assert s.execute_transition(7) is True
+        assert s._executed_transitions == [7]
+
     def test_process_proposals_returns_commit_welcome(self):
         s = self._make()
         result = s.process_proposals(0, b"proposals")
