@@ -18,12 +18,6 @@ from typing import Optional
 
 _log = logging.getLogger(__name__)
 
-# davey 0.2 renamed its decrypt failures, so each of these covers both releases' wording.
-NO_KEY_ERRORS = ("NoDecryptorForUser",)
-REPLAYED_NONCE_ERRORS = ("DuplicateNonce", "InvalidNonce")
-KEY_DOES_NOT_FIT_ERRORS = ("NoValidCryptorFound", "DecryptionFailure", "MissingCryptor")
-NOT_RECOGNISED_AS_ENCRYPTED_ERRORS = ("UnencryptedWhenPassthroughDisabled",)
-
 # ---------------------------------------------------------------------------
 # Optional import — keep non-DAVE voice working if davey isn't installed.
 # ---------------------------------------------------------------------------
@@ -74,10 +68,6 @@ class _DecryptFailures:
 # ---------------------------------------------------------------------------
 # Live adapter
 # ---------------------------------------------------------------------------
-
-
-def _names_any(error_message: str, names: tuple[str, ...]) -> bool:
-    return any(name in error_message for name in names)
 
 
 class DaveSession:
@@ -334,7 +324,7 @@ class DaveSession:
             except ValueError as exc:
                 failures = self._record_failure(user_id)
                 error_message = str(exc)
-                if failures and _names_any(error_message, NO_KEY_ERRORS):
+                if failures and "NoDecryptorForUser" in error_message:
                     # Expected during key exchange — this user's encryption key isn't set up yet.
                     _log.debug(
                         "DAVE decrypt: no decryptor yet (handshake pending) uid=%d guild_id=%s failure=%d",
@@ -342,41 +332,8 @@ class DaveSession:
                         self._guild_id,
                         failures,
                     )
-                elif failures and _names_any(error_message, REPLAYED_NONCE_ERRORS):
-                    # Replay protection: this packet counter was already seen, so drop it.
-                    _log.debug(
-                        "DAVE decrypt: duplicate nonce uid=%d guild_id=%s failure=%d",
-                        user_id,
-                        self._guild_id,
-                        failures,
-                    )
-                elif failures and _names_any(error_message, KEY_DOES_NOT_FIT_ERRORS):
-                    # We hold a key for this user but it will not open this frame. Keep the
-                    # error's own words, which say how many keys were tried.
-                    _log.debug(
-                        "DAVE decrypt: no valid cryptor uid=%d guild_id=%s failure=%d"
-                        " frame_bytes=%d frame_tail=%s: %s",
-                        user_id,
-                        self._guild_id,
-                        failures,
-                        len(data),
-                        data[-4:].hex(),
-                        exc,
-                    )
-                elif failures and _names_any(error_message, NOT_RECOGNISED_AS_ENCRYPTED_ERRORS):
-                    # The frame did not end where we expected, so its trailer was not found.
-                    _log.warning(
-                        "DAVE decrypt: frame not recognised as encrypted uid=%d guild_id=%s"
-                        " failure=%d frame_bytes=%d frame_tail=%s: %s",
-                        user_id,
-                        self._guild_id,
-                        failures,
-                        len(data),
-                        data[-4:].hex(),
-                        exc,
-                    )
                 elif failures:
-                    # DecryptionFailed or unknown — worth knowing about.
+                    # Let the error say what went wrong, rather than us guessing from its name.
                     _log.warning(
                         "DAVE decrypt failed uid=%d guild_id=%s failure=%d"
                         " frame_bytes=%d frame_tail=%s: %s",
