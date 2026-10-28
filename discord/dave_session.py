@@ -283,15 +283,17 @@ class DaveSession:
                         failures,
                     )
                 elif failures and "NoValidCryptorFound" in error_message:
-                    # We hold a key for this user but it will not open this frame.
+                    # We hold a key for this user but it will not open this frame. The error
+                    # names which of the four reasons it was, so keep its own words.
                     _log.debug(
                         "DAVE decrypt: no valid cryptor uid=%d guild_id=%s failure=%d"
-                        " frame_bytes=%d frame_tail=%s",
+                        " frame_bytes=%d frame_tail=%s: %s",
                         user_id,
                         self._guild_id,
                         failures,
                         len(data),
                         data[-4:].hex(),
+                        exc,
                     )
                 elif failures:
                     # DecryptionFailed or unknown — worth knowing about.
