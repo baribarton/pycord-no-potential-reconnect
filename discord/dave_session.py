@@ -12,6 +12,7 @@ Library docs: davey 0.1.3 type stubs (davey/__init__.pyi)
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Optional
@@ -45,24 +46,32 @@ DAVE_QUEUE_MAX_PER_SSRC: int = 32
 #: Maximum total buffered packets across all audio streams.
 DAVE_QUEUE_MAX_TOTAL: int = 256
 
-#: Seconds of failures with no successes before a user counts as cut off.
-STUCK_USER_SECONDS: float = 180.0
+#: Seconds of failures with no successes before a user counts as cut off. Lower it with
+#: DAVE_STUCK_USER_SECONDS when reproducing a fault, so the report does not take minutes.
+STUCK_USER_SECONDS: float = float(os.getenv("DAVE_STUCK_USER_SECONDS", "180"))
 
 #: Log a user's first few decrypt failures, then only every Nth, so one cut-off user
 #: cannot fill the log with fifty identical lines a second.
 DECRYPT_FAILURES_LOGGED_IN_FULL: int = 5
 DECRYPT_FAILURE_LOG_INTERVAL: int = 1000
 
+# A user who alternates between failing and decrypting would report a recovery every
+# other frame, so only the first few runs per user are reported in full.
+RECOVERIES_LOGGED_IN_FULL: int = 10
+
 
 class _DecryptFailures:
     """One user's unbroken run of decrypt failures. Discarded as soon as they decrypt again."""
 
-    __slots__ = ("started_at", "count", "reported")
+    __slots__ = ("started_at", "count", "reported", "epoch", "passthrough")
 
-    def __init__(self) -> None:
+    def __init__(self, epoch=None, passthrough=None) -> None:
         self.started_at = time.monotonic()
         self.count = 0
         self.reported = False
+        # The group state when this user first stopped decrypting, to compare against now.
+        self.epoch = epoch
+        self.passthrough = passthrough
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +105,7 @@ class DaveSession:
         self._decrypt_ok: dict[int, int] = {}
         self._decrypt_fail: dict[int, int] = {}
         self._current_failures: dict[int, _DecryptFailures] = {}
+        self._recovery_count: dict[int, int] = {}
         self._guild_id = guild_id
         _log.debug(
             "DaveSession created: protocol_version=%d user_id=%d channel_id=%d guild_id=%s",
@@ -116,6 +126,14 @@ class DaveSession:
     def epoch(self) -> Optional[int]:
         """Current key generation number — increments each time group membership changes. ``None`` before the first group is formed."""
         return self._davey_session.epoch
+
+    @property
+    def group_size(self) -> Optional[int]:
+        """How many members are in the encrypted group, or ``None`` if there is no group."""
+        try:
+            return len(self._davey_session.get_user_ids())
+        except Exception:
+            return None
 
     @property
     def status_name(self) -> str:
@@ -319,10 +337,16 @@ class DaveSession:
 
                 # Only real decrypted audio means this user is being heard again.
                 if result != data:
-                    self._current_failures.pop(user_id, None)
+                    recovered = self._current_failures.pop(user_id, None)
+                    if recovered is not None and recovered.count:
+                        runs = self._recovery_count[user_id] = (
+                            self._recovery_count.get(user_id, 0) + 1
+                        )
+                        if runs <= RECOVERIES_LOGGED_IN_FULL or recovered.reported:
+                            self._log_recovery(user_id, recovered, runs)
                 return result
             except ValueError as exc:
-                failures = self._record_failure(user_id)
+                failures = self._record_failure(user_id, data)
                 error_message = str(exc)
                 if failures and "NoDecryptorForUser" in error_message:
                     # Expected during key exchange — this user's encryption key isn't set up yet.
@@ -357,7 +381,37 @@ class DaveSession:
                     )
                 return None
 
-    def _record_failure(self, user_id: int) -> int:
+    def _log_recovery(
+        self, user_id: int, failures: "_DecryptFailures", run: int
+    ) -> None:
+        """Report a user whose audio started decrypting again after a run of failures.
+
+        Whether a run ends on its own, and what the group was doing when it did, is the
+        clearest signal we have for telling a brief stumble apart from a real fault.
+        """
+        _log.info(
+            "DAVE recovered: uid=%d guild_id=%s after=%d broken_secs=%.1f"
+            " epoch_then=%s epoch_now=%s passthrough_then=%s passthrough_now=%s"
+            " reported=%s run=%d",
+            user_id,
+            self._guild_id,
+            failures.count,
+            time.monotonic() - failures.started_at,
+            failures.epoch,
+            self.epoch,
+            failures.passthrough,
+            self._passthrough_of(user_id),
+            failures.reported,
+            run,
+        )
+
+    def _passthrough_of(self, user_id: int):
+        try:
+            return self._davey_session.can_passthrough(user_id)
+        except Exception:
+            return None
+
+    def _record_failure(self, user_id: int, data: Optional[bytes] = None) -> int:
         """Count a decrypt failure and return its number, or 0 if it should not be logged.
 
         Also reports a user whose audio has not decrypted at all for a long time, once per
@@ -366,7 +420,9 @@ class DaveSession:
         self._decrypt_fail[user_id] = self._decrypt_fail.get(user_id, 0) + 1
         failures = self._current_failures.get(user_id)
         if failures is None:
-            failures = self._current_failures[user_id] = _DecryptFailures()
+            failures = self._current_failures[user_id] = _DecryptFailures(
+                self.epoch, self._passthrough_of(user_id)
+            )
         failures.count += 1
 
         if (
@@ -376,7 +432,7 @@ class DaveSession:
             failures.reported = True
             _log.warning(
                 "DAVE: no audio can be decrypted for this user: %s",
-                self._describe(user_id),
+                self._describe(user_id, failures, data),
             )
 
         if (
@@ -386,7 +442,12 @@ class DaveSession:
             return failures.count
         return 0
 
-    def _describe(self, user_id: int) -> str:
+    def _describe(
+        self,
+        user_id: int,
+        failures: Optional["_DecryptFailures"] = None,
+        frame: Optional[bytes] = None,
+    ) -> str:
         """Describe why one user's audio will not decrypt.
 
         ``in_group`` is the useful part: a user missing from the encrypted group was
@@ -411,12 +472,54 @@ class DaveSession:
         except Exception:
             stats_text = "unavailable"
 
+        broke_at = (
+            f"epoch_then={failures.epoch} passthrough_then={failures.passthrough} "
+            f"broken_secs={time.monotonic() - failures.started_at:.1f} "
+            if failures is not None
+            else ""
+        )
+        # One frame, once per stuck user, so its layout can be checked by hand later.
+        whole_frame = f" first_frame={frame.hex()}" if frame else ""
+
         return (
             f"uid={user_id} guild_id={self._guild_id} in_group={in_group} "
             f"epoch={self.epoch} ready={self.ready} status={self.status_name} "
+            f"passthrough={self._passthrough_of(user_id)} {broke_at}"
             f"group_size={len(group_user_ids)} group={group_user_ids} "
-            f"davey[{stats_text}]"
+            f"davey[{stats_text}] peers[{self._peer_stats(group_user_ids, user_id)}]"
+            f"{whole_frame}"
         )
+
+    def _peer_stats(self, group_user_ids: list[int], user_id: int) -> str:
+        """Summarise how everyone else in the group is decrypting.
+
+        The same key material and epoch serve the whole group, so a stuck user next to
+        healthy peers means the problem is specific to that one sender.
+        """
+        own_user_id = getattr(self._davey_session, "user_id", None)
+        peers = []
+        for peer_id in group_user_ids:
+            if peer_id == user_id or peer_id == own_user_id:
+                continue
+            try:
+                stats = self._davey_session.get_decryption_stats(
+                    peer_id, _davey.MediaType.audio
+                )
+            except Exception:
+                peers.append(f"{peer_id}=unavailable")
+                continue
+
+            if stats is None:
+                peers.append(f"{peer_id}=never_decrypted")
+                continue
+
+            peers.append(
+                f"{peer_id}[successes={stats.successes} failures={stats.failures} "
+                f"passthroughs={stats.passthroughs} missing_keys={stats.missing_keys} "
+                f"invalid_nonces={stats.invalid_nonces}]"
+            )
+
+        return " ".join(peers) if peers else "nobody else in the group"
 
     def can_passthrough(self, user_id: int) -> bool:
         """Whether unencrypted audio frames should be accepted for this user.

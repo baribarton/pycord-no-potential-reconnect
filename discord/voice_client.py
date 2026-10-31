@@ -687,8 +687,10 @@ class VoiceClient(VoiceProtocol):
             return
 
         _log.debug(
-            "DAVE: execute_transition id=%d protocol_version=%d",
+            "DAVE: execute_transition id=%d guild_id=%s epoch=%s protocol_version=%d",
             transition_id,
+            self.guild.id if self.guild else None,
+            self.dave_session.epoch if self.dave_session is not None else None,
             protocol_version,
         )
         if protocol_version == 0:
@@ -706,8 +708,12 @@ class VoiceClient(VoiceProtocol):
             if self.dave_session is not None:
                 self.dave_session.execute_transition(transition_id)
             _log.info(
-                "DAVE: executing transition to protocol_version=%d (session.ready=%s)",
+                "DAVE: executing transition to protocol_version=%d guild_id=%s"
+                " epoch=%s roster=%s (session.ready=%s)",
                 protocol_version,
+                self.guild.id if self.guild else None,
+                self.dave_session.epoch if self.dave_session is not None else None,
+                self.dave_session.group_size if self.dave_session is not None else None,
                 self.dave_session.ready if self.dave_session else "N/A",
             )
 

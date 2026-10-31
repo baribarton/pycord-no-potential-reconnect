@@ -952,6 +952,19 @@ class DiscordVoiceWebSocket:
 
         await self.send_as_json(payload)
 
+    @property
+    def _dave_guild_id(self):
+        """The guild this voice websocket belongs to, for log lines."""
+        voice_client = self._connection
+        return voice_client.guild.id if voice_client and voice_client.guild else None
+
+    @property
+    def _dave_epoch(self):
+        """The encrypted group's current epoch, or None when there is no group yet."""
+        voice_client = self._connection
+        session = getattr(voice_client, "dave_session", None)
+        return session.epoch if session is not None else None
+
     async def send_transition_ready(self, transition_id: int) -> None:
         """Tell the server we are ready for the announced encryption change.
 
@@ -962,7 +975,10 @@ class DiscordVoiceWebSocket:
             "op": self.DAVE_TRANSITION_READY,
             "d": {"transition_id": transition_id},
         }
-        _log.debug("DAVE: sending transition_ready transition_id=%d", transition_id)
+        _log.info(
+            "DAVE: sending transition_ready transition_id=%d guild_id=%s epoch=%s",
+            transition_id, self._dave_guild_id, self._dave_epoch,
+        )
         await self.send_as_json(payload)
 
     async def received_message(self, msg):
@@ -1028,9 +1044,11 @@ class DiscordVoiceWebSocket:
             transition_id = data["transition_id"]
             protocol_version = data["protocol_version"]
             self.last_dave_op = op
-            _log.debug(
-                "DAVE: prepare_transition id=%d protocol_version=%d",
+            _log.info(
+                "DAVE: prepare_transition id=%d guild_id=%s epoch=%s protocol_version=%d",
                 transition_id,
+                self._dave_guild_id,
+                self._dave_epoch,
                 protocol_version,
             )
             voice_client = self._connection
@@ -1047,7 +1065,10 @@ class DiscordVoiceWebSocket:
         elif op == self.DAVE_EXECUTE_TRANSITION:
             transition_id = data["transition_id"]
             self.last_dave_op = op
-            _log.debug("DAVE: execute_transition id=%d", transition_id)
+            _log.info(
+                "DAVE: execute_transition id=%d guild_id=%s epoch=%s",
+                transition_id, self._dave_guild_id, self._dave_epoch,
+            )
             await self._connection._execute_transition(transition_id)
 
         elif op == self.DAVE_PREPARE_EPOCH:
@@ -1124,9 +1145,11 @@ class DiscordVoiceWebSocket:
                 return
             transition_id = struct.unpack_from(">H", msg, 3)[0]
             commit = msg[5:]
-            _log.debug(
-                "DAVE: announce_commit_transition id=%d commit_len=%d",
+            _log.info(
+                "DAVE: announce_commit_transition id=%d guild_id=%s epoch=%s commit_len=%d",
                 transition_id,
+                self._dave_guild_id,
+                self._dave_epoch,
                 len(commit),
             )
             try:
