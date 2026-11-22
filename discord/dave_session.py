@@ -358,7 +358,7 @@ class DaveSession:
                     )
                 elif failures:
                     # Let the error say what went wrong, rather than us guessing from its name.
-                    _log.warning(
+                    _log.debug(
                         "DAVE decrypt failed uid=%d guild_id=%s failure=%d"
                         " frame_bytes=%d frame_tail=%s: %s",
                         user_id,
@@ -389,7 +389,7 @@ class DaveSession:
         Whether a run ends on its own, and what the group was doing when it did, is the
         clearest signal we have for telling a brief stumble apart from a real fault.
         """
-        _log.info(
+        _log.debug(
             "DAVE recovered: uid=%d guild_id=%s after=%d broken_secs=%.1f"
             " epoch_then=%s epoch_now=%s passthrough_then=%s passthrough_now=%s"
             " reported=%s run=%d",

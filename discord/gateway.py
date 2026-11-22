@@ -975,7 +975,7 @@ class DiscordVoiceWebSocket:
             "op": self.DAVE_TRANSITION_READY,
             "d": {"transition_id": transition_id},
         }
-        _log.info(
+        _log.debug(
             "DAVE: sending transition_ready transition_id=%d guild_id=%s epoch=%s",
             transition_id, self._dave_guild_id, self._dave_epoch,
         )
@@ -1044,7 +1044,7 @@ class DiscordVoiceWebSocket:
             transition_id = data["transition_id"]
             protocol_version = data["protocol_version"]
             self.last_dave_op = op
-            _log.info(
+            _log.debug(
                 "DAVE: prepare_transition id=%d guild_id=%s epoch=%s protocol_version=%d",
                 transition_id,
                 self._dave_guild_id,
@@ -1065,7 +1065,7 @@ class DiscordVoiceWebSocket:
         elif op == self.DAVE_EXECUTE_TRANSITION:
             transition_id = data["transition_id"]
             self.last_dave_op = op
-            _log.info(
+            _log.debug(
                 "DAVE: execute_transition id=%d guild_id=%s epoch=%s",
                 transition_id, self._dave_guild_id, self._dave_epoch,
             )
@@ -1145,7 +1145,7 @@ class DiscordVoiceWebSocket:
                 return
             transition_id = struct.unpack_from(">H", msg, 3)[0]
             commit = msg[5:]
-            _log.info(
+            _log.debug(
                 "DAVE: announce_commit_transition id=%d guild_id=%s epoch=%s commit_len=%d",
                 transition_id,
                 self._dave_guild_id,

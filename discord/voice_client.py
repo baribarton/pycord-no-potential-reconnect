@@ -707,7 +707,7 @@ class VoiceClient(VoiceProtocol):
             # The key a commit or welcome staged is not used until we switch to it here.
             if self.dave_session is not None:
                 self.dave_session.execute_transition(transition_id)
-            _log.info(
+            _log.debug(
                 "DAVE: executing transition to protocol_version=%d guild_id=%s"
                 " epoch=%s roster=%s (session.ready=%s)",
                 protocol_version,
