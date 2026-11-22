@@ -952,6 +952,19 @@ class DiscordVoiceWebSocket:
 
         await self.send_as_json(payload)
 
+    @property
+    def _dave_guild_id(self):
+        """The guild this voice websocket belongs to, for log lines."""
+        voice_client = self._connection
+        return voice_client.guild.id if voice_client and voice_client.guild else None
+
+    @property
+    def _dave_epoch(self):
+        """The encrypted group's current epoch, or None when there is no group yet."""
+        voice_client = self._connection
+        session = getattr(voice_client, "dave_session", None)
+        return session.epoch if session is not None else None
+
     async def send_transition_ready(self, transition_id: int) -> None:
         """Tell the server we are ready for the announced encryption change.
 
@@ -962,7 +975,10 @@ class DiscordVoiceWebSocket:
             "op": self.DAVE_TRANSITION_READY,
             "d": {"transition_id": transition_id},
         }
-        _log.debug("DAVE: sending transition_ready transition_id=%d", transition_id)
+        _log.info(
+            "DAVE: sending transition_ready transition_id=%d guild_id=%s epoch=%s",
+            transition_id, self._dave_guild_id, self._dave_epoch,
+        )
         await self.send_as_json(payload)
 
     async def received_message(self, msg):
@@ -1028,9 +1044,11 @@ class DiscordVoiceWebSocket:
             transition_id = data["transition_id"]
             protocol_version = data["protocol_version"]
             self.last_dave_op = op
-            _log.debug(
-                "DAVE: prepare_transition id=%d protocol_version=%d",
+            _log.info(
+                "DAVE: prepare_transition id=%d guild_id=%s epoch=%s protocol_version=%d",
                 transition_id,
+                self._dave_guild_id,
+                self._dave_epoch,
                 protocol_version,
             )
             voice_client = self._connection
@@ -1047,7 +1065,10 @@ class DiscordVoiceWebSocket:
         elif op == self.DAVE_EXECUTE_TRANSITION:
             transition_id = data["transition_id"]
             self.last_dave_op = op
-            _log.debug("DAVE: execute_transition id=%d", transition_id)
+            _log.info(
+                "DAVE: execute_transition id=%d guild_id=%s epoch=%s",
+                transition_id, self._dave_guild_id, self._dave_epoch,
+            )
             await self._connection._execute_transition(transition_id)
 
         elif op == self.DAVE_PREPARE_EPOCH:
@@ -1124,13 +1145,15 @@ class DiscordVoiceWebSocket:
                 return
             transition_id = struct.unpack_from(">H", msg, 3)[0]
             commit = msg[5:]
-            _log.debug(
-                "DAVE: announce_commit_transition id=%d commit_len=%d",
+            _log.info(
+                "DAVE: announce_commit_transition id=%d guild_id=%s epoch=%s commit_len=%d",
                 transition_id,
+                self._dave_guild_id,
+                self._dave_epoch,
                 len(commit),
             )
             try:
-                voice_client.dave_session.process_commit(commit)
+                should_prepare = voice_client.dave_session.process_commit(commit)
             except ValueError as exc:
                 _log.warning(
                     "DAVE: process_commit failed (transition_id=%d): %s",
@@ -1138,6 +1161,8 @@ class DiscordVoiceWebSocket:
                     exc,
                 )
                 await self._recover_from_invalid_commit(transition_id)
+                return
+            if should_prepare and not await self._prepare_transition(transition_id):
                 return
             if voice_client.dave_session.ready:
                 await voice_client._drain_dave_queue()
@@ -1172,6 +1197,8 @@ class DiscordVoiceWebSocket:
                 )
                 await self._recover_from_invalid_commit(transition_id)
                 return
+            if not await self._prepare_transition(transition_id):
+                return
             if voice_client.dave_session.ready:
                 await voice_client._drain_dave_queue()
             # Temporarily allow unencrypted audio while the new encryption key is being applied.
@@ -1183,6 +1210,34 @@ class DiscordVoiceWebSocket:
 
         else:
             _log.debug("DAVE: unknown binary opcode %d (%d bytes), ignoring", binary_opcode, len(msg))
+
+    async def _prepare_transition(self, transition_id: int) -> bool:
+        """Stage the key a commit or welcome just gave us, and say whether it worked.
+
+        A transition ID of zero has no announcement to wait for, so it is switched to
+        straight away. A failure here is reported to the server like a bad commit,
+        because carrying on would leave us decrypting with a key nobody is using.
+        """
+        voice_client = self._connection
+        try:
+            voice_client.dave_session.prepare_transition(
+                transition_id, voice_client.dave_protocol_version
+            )
+        except ValueError as exc:
+            _log.warning(
+                "DAVE: prepare_transition failed (transition_id=%d): %s",
+                transition_id,
+                exc,
+            )
+            await self._recover_from_invalid_commit(transition_id)
+            return False
+
+        if transition_id == 0:
+            voice_client.dave_pending_transitions.setdefault(
+                transition_id, voice_client.dave_protocol_version
+            )
+            await voice_client._execute_transition(transition_id)
+        return True
 
     async def _recover_from_invalid_commit(self, transition_id: int) -> None:
         """Tell the server a key-exchange message was invalid, reset local state, and reconnect.

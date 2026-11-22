@@ -687,8 +687,10 @@ class VoiceClient(VoiceProtocol):
             return
 
         _log.debug(
-            "DAVE: execute_transition id=%d protocol_version=%d",
+            "DAVE: execute_transition id=%d guild_id=%s epoch=%s protocol_version=%d",
             transition_id,
+            self.guild.id if self.guild else None,
+            self.dave_session.epoch if self.dave_session is not None else None,
             protocol_version,
         )
         if protocol_version == 0:
@@ -702,9 +704,16 @@ class VoiceClient(VoiceProtocol):
         else:
             # Encryption session was already reinitialised at PREPARE_EPOCH; this activates the new version.
             self.dave_protocol_version = protocol_version
+            # The key a commit or welcome staged is not used until we switch to it here.
+            if self.dave_session is not None:
+                self.dave_session.execute_transition(transition_id)
             _log.info(
-                "DAVE: executing transition to protocol_version=%d (session.ready=%s)",
+                "DAVE: executing transition to protocol_version=%d guild_id=%s"
+                " epoch=%s roster=%s (session.ready=%s)",
                 protocol_version,
+                self.guild.id if self.guild else None,
+                self.dave_session.epoch if self.dave_session is not None else None,
+                self.dave_session.group_size if self.dave_session is not None else None,
                 self.dave_session.ready if self.dave_session else "N/A",
             )
 
@@ -837,15 +846,28 @@ class VoiceClient(VoiceProtocol):
         data = data[:-4]
 
         r = box.decrypt(bytes(data), bytes(header), bytes(nonce))
-        # Discord adds 8 bytes of data before the opus data.
-        # This can be removed, and at this time, discarded as it is unclear what they are for.
-        return r[8:]
+        # The RTP header extension's body sits in front of the audio, and the header we just
+        # authenticated says how long it is. Senders that send no extension have nothing in front.
+        return r[self.header_ext_body_len(header):]
+
+    @staticmethod
+    def header_ext_body_len(header) -> int:
+        """How many bytes of RTP header extension sit in front of the audio.
+
+        In the ``_rtpsize`` modes the ``0xBEDE`` marker and the length that follows it stay in
+        the header, so only the extension's body lands at the start of the decrypted payload.
+        """
+        if len(header) < 12 or not header[0] & 0b00_0_1_0000:
+            return 0
+
+        words = struct.unpack_from(">H", header, len(header) - 2)[0]
+        return words * 4
 
     def _report_rtp_header_shape(self, ssrc: int, header: bytes) -> None:
         """Log how much of this stream's packet is header, once for each shape we see.
 
-        We strip a fixed 8 bytes of header extension before decrypting, so a sender whose
-        client sends a different amount loses part of its audio.
+        The extension's body is stripped off the front of the audio after decrypting, so its
+        size is worth seeing when a sender cannot be decrypted at all.
         """
         if not self.mode.endswith("_rtpsize") or len(header) < 12:
             return
@@ -864,12 +886,13 @@ class VoiceClient(VoiceProtocol):
         _REPORTED_RTP_SHAPES.add(shape)
         _log.debug(
             "RTP header shape: ssrc=%d uid=%s guild_id=%s padded=%s extended=%s"
-            " extension_bytes=%d stripped=8",
+            " extension_bytes=%d stripped=%d",
             ssrc,
             user_id,
             guild_id,
             padded,
             extended,
+            words * 4,
             words * 4,
         )
 
